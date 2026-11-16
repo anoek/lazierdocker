@@ -97,7 +97,12 @@ through the `com.docker.compose.project.config_files` label.
 Requires Rust (stable) and **Zig 0.16.0** on `PATH`; Zig builds the vendored libghostty-vt. The first build
 fetches one Zig dependency.
 
-    cargo build --release
+    make                      # optimised build → target/release/lazierdocker
+    make run ARGS="-H tcp://127.0.0.1:23750"
+    make install              # → ~/.local/bin/lazierdocker (PREFIX=/usr/local for system-wide)
+    make uninstall            # same PREFIX as install
+
+`make test` and `make clean` are also available.
 
 Linux and macOS are supported.
 

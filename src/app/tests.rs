@@ -792,6 +792,36 @@ mod docker_actions {
         app
     }
 
+    fn has_browser_item(app: &App, key: &NodeKey) -> bool {
+        app.item_menu(key).items.iter().any(|i| i.label == "Open in browser")
+    }
+
+    #[test]
+    fn open_in_browser_only_offered_with_a_published_port() {
+        let mut app = loaded_app();
+        let k = NodeKey::Container(loner(&app));
+        let web = NodeKey::Service("demo".into(), "web".into());
+        assert!(!has_browser_item(&app, &k), "loner publishes nothing");
+        assert!(!has_browser_item(&app, &web));
+        // The w key still explains why nothing opened.
+        select(&mut app, k.clone());
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(app.toast.as_ref().is_some_and(|(m, _)| m.contains("no published ports")));
+
+        let mut snap = demo_snapshot();
+        for c in snap.containers.iter_mut().filter(|c| c.name == "loner" || c.name == "demo-web-1") {
+            c.ports = vec![crate::docker::model::Port {
+                ip: Some("0.0.0.0".into()),
+                private: 80,
+                public: Some(8080),
+                proto: "tcp".into(),
+            }];
+        }
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snap)));
+        assert!(has_browser_item(&app, &k));
+        assert!(has_browser_item(&app, &web));
+    }
+
     #[test]
     fn stop_requires_confirm() {
         let mut app = loaded_app();

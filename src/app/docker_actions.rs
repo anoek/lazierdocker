@@ -418,6 +418,10 @@ impl App {
             .iter()
             .filter_map(|(c, label)| {
                 let action = self.docker_key_action(*c, key)?;
+                // Leave out items that can only say why they can't run (no published port to open).
+                if matches!(action, Action::Flash(_)) {
+                    return None;
+                }
                 let danger = matches!(c, 'd' | 'D');
                 let item = MenuItem::new(*label, action).key(&c.to_string());
                 Some(if danger { item.danger() } else { item })

@@ -73,10 +73,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 }
 
 pub async fn run(opts: Options) -> Result<()> {
-    let docker = match &opts.host {
-        Some(h) => Docker::connect_to(h)?,
-        None => Docker::connect()?,
-    };
+    let docker = Docker::connect_to(&crate::docker::client::resolve_host(opts.host.as_deref()))?;
     let (tx, mut rx): (EventTx, EventRx) = tokio::sync::mpsc::unbounded_channel();
     let local = detect_local_compose(&opts.compose_files, opts.project.as_deref()).await;
     let refresher = spawn_refresh(docker.clone(), local, tx.clone());

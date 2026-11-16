@@ -146,13 +146,9 @@ impl App {
                     c.id.hash(&mut h);
                     c.state.as_str().hash(&mut h);
                     c.exit_code.hash(&mut h);
-                    match tab {
-                        Tab::Top => self.tick.hash(&mut h),
-                        Tab::Stats => {
-                            self.stats.get(&c.id).and_then(|s| s.samples.back()).map(|(t, _)| *t).hash(&mut h);
-                            self.hits.content.iter().map(|(_, r)| r.width).max().hash(&mut h);
-                        }
-                        _ => {}
+                    if tab == Tab::Stats {
+                        self.stats.get(&c.id).and_then(|s| s.samples.back()).map(|(t, _)| *t).hash(&mut h);
+                        self.hits.content.iter().map(|(_, r)| r.width).max().hash(&mut h);
                     }
                 } else {
                     0u8.hash(&mut h);
@@ -187,6 +183,17 @@ impl App {
             };
             let key = ContentKey { rev: self.content_rev(&target, tab), target: target.clone(), tab };
             if self.panes.get(&id).and_then(|p| p.loaded.as_ref()) == Some(&key) {
+                // Top refreshes every second, one request at a time.
+                let tick = self.tick;
+                let due = self.panes.get(&id).is_some_and(|p| tab == Tab::Top && !p.inflight && p.refreshed_at < tick);
+                if due {
+                    if let Plan::Load(spec) = self.plan_content(&target, tab, id) {
+                        let p = self.panes.get_mut(&id).expect("pane exists");
+                        p.inflight = true;
+                        p.refreshed_at = tick;
+                        effects.push(Effect::Load { pane: id, key, spec });
+                    }
+                }
                 continue;
             }
             let same_view = self
@@ -218,6 +225,8 @@ impl App {
                         pane.stop_task();
                         pane.content = Content::Doc(DocSurface::message("Loading…"));
                     }
+                    pane.inflight = true;
+                    pane.refreshed_at = self.tick;
                     effects.push(Effect::Load { pane: id, key, spec });
                 }
                 Plan::Logs { container_id } => {

@@ -134,11 +134,23 @@ pub struct Pane {
     pub loaded: Option<inspect::ContentKey>,
     /// Background task feeding this pane (log stream); aborted when replaced.
     pub task: Option<tokio::task::AbortHandle>,
+    /// A Load for `loaded` is outstanding.
+    pub inflight: bool,
+    /// Tick of the last Load (periodic refresh of Top).
+    pub refreshed_at: u64,
 }
 
 impl Pane {
     pub fn new(kind: PaneKind) -> Self {
-        Self { kind, tabs: HashMap::new(), content: Content::Doc(DocSurface::default()), loaded: None, task: None }
+        Self {
+            kind,
+            tabs: HashMap::new(),
+            content: Content::Doc(DocSurface::default()),
+            loaded: None,
+            task: None,
+            inflight: false,
+            refreshed_at: 0,
+        }
     }
 
     pub fn stop_task(&mut self) {
@@ -191,6 +203,9 @@ pub struct App {
     /// Transient status message.
     pub toast: Option<(String, Instant)>,
     pub overlay: Option<overlay::Overlay>,
+    /// A popup raised by a background event while a shell had focus; shown
+    /// once focus leaves the shell so it can't capture typing.
+    pub deferred: Option<overlay::Overlay>,
     pub selection: Option<selection::Selection>,
     pub copy: Option<copy_mode::CopyCursor>,
     /// Running docker operations (status bar).
@@ -233,6 +248,7 @@ impl App {
             cursor: None,
             toast: None,
             overlay: None,
+            deferred: None,
             selection: None,
             copy: None,
             pending_ops: Vec::new(),
@@ -261,12 +277,43 @@ impl App {
         self.dirty = true;
     }
 
+    pub fn live_terminal_focused(&self) -> bool {
+        self.focus == Focus::Panes
+            && matches!(self.panes.get(&self.layout.focus), Some(Pane { kind: PaneKind::Terminal { .. }, content: Content::Term(t), .. }) if t.exited().is_none())
+    }
+
+    /// Show a popup that wasn't asked for by the current keystroke: deferred
+    /// while a live shell has focus.
+    pub fn raise(&mut self, ov: overlay::Overlay) {
+        if self.live_terminal_focused() || self.overlay.is_some() {
+            self.deferred = Some(ov);
+        } else {
+            self.overlay = Some(ov);
+        }
+        self.dirty = true;
+    }
+
+    pub fn flush_deferred(&mut self) {
+        if self.deferred.is_some() && self.overlay.is_none() && !self.live_terminal_focused() {
+            self.overlay = self.deferred.take();
+            self.dirty = true;
+        }
+    }
+
     /// Top absolute row currently shown in a pane's content.
     pub fn content_top(&self, pane: PaneId) -> usize {
         match self.panes.get(&pane).map(|p| &p.content) {
             Some(Content::Doc(d)) => d.scroll,
             Some(Content::Term(t)) => t.viewport_top(),
             None => 0,
+        }
+    }
+
+    /// Leftmost content column shown (documents scroll horizontally).
+    pub fn content_left(&self, pane: PaneId) -> usize {
+        match self.panes.get(&pane).map(|p| &p.content) {
+            Some(Content::Doc(d)) => d.hscroll,
+            _ => 0,
         }
     }
 
@@ -278,7 +325,7 @@ impl App {
         }
         let x = col.clamp(r.x, r.right() - 1) - r.x;
         let y = row.clamp(r.y, r.bottom() - 1) - r.y;
-        Some((self.content_top(pane) + y as usize, x as usize))
+        Some((self.content_top(pane) + y as usize, self.content_left(pane) + x as usize))
     }
 
     /// Text of an absolute content row.
@@ -358,7 +405,7 @@ impl App {
                             if crate::docker::ops::is_must_stop(&e) =>
                         {
                             let name = self.snap.container(&id).map(|c| c.name.clone()).unwrap_or(id.clone());
-                            self.overlay = Some(overlay::Overlay::Confirm {
+                            self.raise(overlay::Overlay::Confirm {
                                 title: "Force remove".into(),
                                 body: format!("{name} is running. Stop and remove it?"),
                                 danger: true,
@@ -369,7 +416,7 @@ impl App {
                                 }),
                             });
                         }
-                        _ => self.show_error(e),
+                        _ => self.raise(overlay::Overlay::Message { title: "Error".into(), body: e, error: true }),
                     },
                 }
                 return vec![Effect::RefreshNow];
@@ -406,6 +453,7 @@ impl App {
             AppEvent::Doc { pane, key, lines } => {
                 if let Some(p) = self.panes.get_mut(&pane) {
                     if p.loaded.as_ref() == Some(&key) {
+                        p.inflight = false;
                         if let Content::Doc(d) = &mut p.content {
                             d.set_lines(lines);
                         } else {

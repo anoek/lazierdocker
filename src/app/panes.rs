@@ -5,6 +5,11 @@ use super::{App, Effect, Focus, Pane, PaneKind};
 use crate::ui::layout::{PaneId, SplitDir};
 use crate::ui::sidebar::NodeKey;
 
+/// Start the container user's login shell (lazydocker's trick), falling back to
+/// /bin/sh when the user has no passwd entry (common with `--user 1001` images).
+pub const EXEC_SHELL_SCRIPT: &str =
+    r#"s=$(grep "^$(id -un 2>/dev/null):" /etc/passwd 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=/bin/sh; exec "$s""#;
+
 impl App {
     /// Split direction for a pane: along its longer visual dimension
     /// (terminal cells are about twice as tall as wide).
@@ -86,7 +91,7 @@ impl App {
             id,
             "/bin/sh".into(),
             "-c".into(),
-            "eval $(grep ^$(id -un): /etc/passwd | cut -d : -f 7-)".into(),
+            EXEC_SHELL_SCRIPT.into(),
         ];
         self.open_terminal(format!("exec {name}"), argv)
     }

@@ -191,11 +191,16 @@ impl App {
     fn paint_copy_cursor(&self, buf: &mut Buffer, id: PaneId, area: Rect) {
         let Some(c) = self.copy.filter(|c| c.pane == id) else { return };
         let top = self.content_top(id);
-        if c.pos.0 < top || c.pos.0 >= top + area.height as usize || c.pos.1 >= area.width as usize {
+        let left = self.content_left(id);
+        if c.pos.0 < top
+            || c.pos.0 >= top + area.height as usize
+            || c.pos.1 < left
+            || c.pos.1 >= left + area.width as usize
+        {
             return;
         }
         let t = self.theme;
-        let cell = &mut buf[(area.x + c.pos.1 as u16, area.y + (c.pos.0 - top) as u16)];
+        let cell = &mut buf[(area.x + (c.pos.1 - left) as u16, area.y + (c.pos.0 - top) as u16)];
         cell.set_style(Style::default().bg(t.accent).fg(t.panel_bg).add_modifier(Modifier::BOLD));
     }
 
@@ -203,10 +208,11 @@ impl App {
         let Some(sel) = self.selection.filter(|s| s.pane == id && s.is_visible()) else { return };
         let t = self.theme;
         let top = self.content_top(id);
+        let left = self.content_left(id);
         let style = Style::default().bg(t.surface1).fg(t.text);
         for y in 0..area.height {
             for x in 0..area.width {
-                if sel.contains(top + y as usize, x as usize) {
+                if sel.contains(top + y as usize, left + x as usize) {
                     buf[(area.x + x, area.y + y)].set_style(style);
                 }
             }
@@ -284,6 +290,9 @@ impl App {
         let toast = self.toast.as_ref().filter(|(_, at)| at.elapsed() < std::time::Duration::from_secs(4));
         const SPIN: [&str; 4] = ["|", "/", "-", "\\"];
         let right = match (&self.docker_error, toast) {
+            _ if self.deferred.is_some() => {
+                Some(("⚠ message waiting: leave the terminal (^b h) to see it".into(), true))
+            }
             _ if !self.pending_ops.is_empty() => {
                 Some((format!("{} {}…", SPIN[(self.tick % 4) as usize], self.pending_ops.join(", ")), false))
             }

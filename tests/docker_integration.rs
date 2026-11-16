@@ -39,3 +39,23 @@ async fn restart_container_via_op() {
     // Errors come back as Err, not panics.
     assert!(run(&docker, DockerOp::Start("no-such-container".into())).await.is_err());
 }
+
+/// Images often run as a UID with no /etc/passwd entry; exec must still give a shell.
+#[test]
+fn exec_shell_script_works_without_passwd_entry() {
+    let Some(host) = test_host() else { return };
+    let script = lazierdocker::app::panes::EXEC_SHELL_SCRIPT;
+    for user in ["4242", "root"] {
+        let mut child = std::process::Command::new("docker")
+            .env("DOCKER_HOST", &host)
+            .args(["exec", "-i", "--user", user, "loner", "/bin/sh", "-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"echo shell-alive\nexit\n").unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("shell-alive"), "user {user}: {out:?}");
+    }
+}

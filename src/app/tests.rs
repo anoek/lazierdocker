@@ -289,8 +289,11 @@ mod streams {
         let id = loner(&app);
         select(&mut app, NodeKey::Container(id.clone()));
         app.set_tab(app.layout.focus, Tab::Top);
-        assert!(matches!(&app.sync_panes()[..], [Effect::Load { spec: LoadSpec::Top { id: i }, .. }] if *i == id));
-        // Top refreshes every tick.
+        let fx = app.sync_panes();
+        let [Effect::Load { spec: LoadSpec::Top { id: i }, key, pane }] = &fx[..] else { panic!("{fx:?}") };
+        assert_eq!(*i, id);
+        // Top refreshes every tick once the previous result arrived.
+        app.handle_app_event(AppEvent::Doc { pane: *pane, key: key.clone(), lines: vec![] });
         app.tick += 1;
         assert_eq!(app.sync_panes().len(), 1);
     }
@@ -939,5 +942,199 @@ mod long_errors {
         assert!(status.trim_end().ends_with('…'), "{status:?}");
         // The pane wraps the message instead of cutting it.
         assert!(row_text(&buf, 2).contains("very long"), "{}", screen(&buf));
+    }
+}
+
+mod review_fixes {
+    use super::*;
+    use crossterm::event::Event;
+
+    fn cat_pane(app: &mut App) -> crate::ui::layout::PaneId {
+        let id = app.open_pane(PaneKind::Terminal { title: "cat".into() }, None);
+        let t = crate::term::TermSurface::spawn(
+            &["cat".into()],
+            &[],
+            40,
+            10,
+            std::sync::Arc::new(|| {}),
+            std::sync::Arc::new(|_, _| {}),
+        )
+        .unwrap();
+        app.panes.get_mut(&id).unwrap().content = Content::Term(t);
+        id
+    }
+
+    fn term_text(app: &App, id: crate::ui::layout::PaneId) -> String {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        match &app.panes[&id].content {
+            Content::Term(t) => t.viewport_text().join("\n"),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn click_leaves_filter_resize_and_copy_modes() {
+        let mut app = loaded_app();
+        draw(&mut app, 120, 30);
+        let (_, r, _) = app.hits.panes[0];
+        for mode in [Mode::Filter, Mode::Resize, Mode::Copy, Mode::Prefix] {
+            app.mode = mode;
+            if mode == Mode::Filter {
+                app.sidebar.filter = "lon".into();
+            }
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), r.x + 3, r.y + 3));
+            app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), r.x + 3, r.y + 3));
+            assert_eq!(app.mode, Mode::Normal, "{mode:?}");
+        }
+        assert_eq!(app.sidebar.filter, "lon", "filter is committed, not cleared");
+        assert!(app.copy.is_none());
+    }
+
+    #[test]
+    fn typing_after_click_reaches_shell_not_filter() {
+        let mut app = loaded_app();
+        draw(&mut app, 120, 30);
+        let id = cat_pane(&mut app);
+        draw(&mut app, 120, 30);
+        app.focus = Focus::Sidebar;
+        app.handle_key(key(KeyCode::Char('/')));
+        let (_, r) = *app.hits.content.iter().find(|(p, _)| *p == id).unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), r.x + 1, r.y + 1));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), r.x + 1, r.y + 1));
+        app.handle_key(key(KeyCode::Char('z')));
+        assert!(app.sidebar.filter.is_empty(), "{:?}", app.sidebar.filter);
+        assert!(term_text(&app, id).contains('z'));
+    }
+
+    #[test]
+    fn paste_ignored_while_overlay_or_mode_active() {
+        let mut app = loaded_app();
+        draw(&mut app, 120, 30);
+        let id = cat_pane(&mut app);
+        app.perform(crate::app::actions::Action::Help);
+        app.handle_event(Event::Paste("PASTED-ONE".into()));
+        app.overlay = None;
+        app.mode = Mode::Resize;
+        app.handle_event(Event::Paste("PASTED-TWO".into()));
+        assert!(!term_text(&app, id).contains("PASTED"), "{}", term_text(&app, id));
+    }
+
+    #[test]
+    fn resize_aborts_drag() {
+        let mut app = loaded_app();
+        draw(&mut app, 100, 20);
+        let div = app.hits.sidebar_divider.unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), div.x, 5));
+        assert!(app.drag.is_some());
+        app.handle_event(Event::Resize(60, 15));
+        assert!(app.drag.is_none());
+    }
+
+    #[test]
+    fn enter_from_sidebar_focuses_inspector_not_shell() {
+        let mut app = loaded_app();
+        draw(&mut app, 120, 30);
+        let inspector = app.layout.focus;
+        let shell = cat_pane(&mut app);
+        assert_eq!(app.layout.focus, shell);
+        app.focus = Focus::Sidebar;
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!((app.focus, app.layout.focus), (Focus::Panes, inspector));
+    }
+}
+
+mod hscroll {
+    use super::*;
+    use ratatui::text::Line;
+
+    #[test]
+    fn l_scrolls_doc_right_and_selection_maps_columns() {
+        let mut app = loaded_app();
+        let rows = app.rows().to_vec();
+        app.sidebar.select(&rows, &NodeKey::Section(crate::ui::sidebar::Section::Volumes));
+        app.sync_panes();
+        let pane = app.layout.focus;
+        let long = format!("{}TARGET{}", "-".repeat(150), "-".repeat(20));
+        app.panes.get_mut(&pane).unwrap().content = Content::Doc(crate::doc::DocSurface::new(vec![Line::raw(long)]));
+        draw(&mut app, 100, 20);
+        app.focus = Focus::Panes;
+        for _ in 0..30 {
+            app.handle_key(key(KeyCode::Char('l')));
+        }
+        let s = screen(&draw(&mut app, 100, 20));
+        assert!(s.contains("TARGET"), "{s}");
+        let r = app.hits.content.iter().find(|(p, _)| *p == pane).unwrap().1;
+        let y = r.y;
+        let x = (0..r.width).find(|x| draw(&mut app, 100, 20)[(r.x + x, y)].symbol() == "T").unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), r.x + x, y));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), r.x + x, y));
+        let fx = app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), r.x + x, y));
+        let Some(Effect::Copy(word)) = fx.first() else { panic!("{fx:?}") };
+        assert!(word.contains("TARGET"), "{word}");
+    }
+}
+
+mod deferred_popups {
+    use super::*;
+    use crate::docker::ops::DockerOp;
+
+    #[test]
+    fn async_popup_waits_until_shell_loses_focus() {
+        let mut app = loaded_app();
+        draw(&mut app, 120, 30);
+        let id = app.open_pane(PaneKind::Terminal { title: "cat".into() }, None);
+        let t = crate::term::TermSurface::spawn(
+            &["cat".into()],
+            &[],
+            40,
+            10,
+            std::sync::Arc::new(|| {}),
+            std::sync::Arc::new(|_, _| {}),
+        )
+        .unwrap();
+        app.panes.get_mut(&id).unwrap().content = Content::Term(t);
+        let loner = app.snap.containers.iter().find(|c| c.name == "loner").unwrap().id.clone();
+        app.handle_app_event(AppEvent::OpDone {
+            op: DockerOp::RemoveContainer { id: loner, force: false, volumes: false },
+            desc: "removing".into(),
+            result: Err("container is running: stop the container before removing or force remove".into()),
+        });
+        assert!(app.overlay.is_none(), "no modal over a focused shell");
+        assert!(screen(&draw(&mut app, 120, 30)).contains("⚠"), "status bar flags the pending message");
+        // Typing goes to the shell, not to the confirmation.
+        assert!(app.handle_key(key(KeyCode::Char('y'))).is_empty());
+        assert!(app.overlay.is_none());
+        // Leaving the shell shows it.
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('h')));
+        assert!(matches!(app.overlay, Some(crate::app::overlay::Overlay::Confirm { .. })), "{:?}", app.overlay);
+    }
+}
+
+mod top_refresh {
+    use super::*;
+    use crate::app::inspect::Tab;
+    use ratatui::text::Line;
+
+    #[test]
+    fn slow_top_result_is_kept_and_requests_dont_pile_up() {
+        let mut app = loaded_app();
+        let id = app.snap.containers.iter().find(|c| c.name == "loner").unwrap().id.clone();
+        let rows = app.rows().to_vec();
+        app.sidebar.select(&rows, &NodeKey::Container(id));
+        let pane = app.layout.focus;
+        app.set_tab(pane, Tab::Top);
+        let fx = app.sync_panes();
+        let Some(Effect::Load { key, .. }) = fx.first().cloned() else { panic!("{fx:?}") };
+        // Seconds pass while docker top is slow: no new requests.
+        app.tick += 3;
+        assert!(app.sync_panes().is_empty(), "request still in flight");
+        // The late result is still shown.
+        app.handle_app_event(AppEvent::Doc { pane, key: key.clone(), lines: vec![Line::raw("PID  CMD")] });
+        assert!(screen(&draw(&mut app, 100, 20)).contains("PID  CMD"));
+        // Next tick refreshes with the same key.
+        app.tick += 1;
+        let fx = app.sync_panes();
+        assert!(matches!(&fx[..], [Effect::Load { key: k, .. }] if *k == key), "{fx:?}");
     }
 }

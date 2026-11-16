@@ -5,12 +5,18 @@ pub mod graph;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
 use ratatui::text::Line;
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone, Default)]
 pub struct DocSurface {
     pub lines: Vec<Line<'static>>,
     pub scroll: usize,
+    /// Horizontal scroll in display columns.
+    pub hscroll: usize,
+    /// Width at the last render.
+    pub view_width: usize,
     /// Keep the view pinned to the bottom as lines arrive.
     pub follow: bool,
     /// Height at the last render (for page scrolling and clamping).
@@ -50,6 +56,15 @@ impl DocSurface {
         self.follow = false;
     }
 
+    fn max_line_width(&self) -> usize {
+        self.lines.iter().map(|l| l.width()).max().unwrap_or(0)
+    }
+
+    pub fn hscroll_by(&mut self, delta: i32) {
+        let max = self.max_line_width().saturating_sub(self.view_width.max(1));
+        self.hscroll = (self.hscroll as i64 + delta as i64).clamp(0, max as i64) as usize;
+    }
+
     pub fn scroll_top(&mut self) {
         self.scroll = 0;
         self.follow = false;
@@ -61,9 +76,35 @@ impl DocSurface {
 
     pub fn render(&mut self, buf: &mut Buffer, area: Rect) {
         self.view_height = area.height as usize;
+        self.view_width = area.width as usize;
         self.clamp();
+        let marker = Style::default().fg(Color::DarkGray);
         for (i, line) in self.lines.iter().skip(self.scroll).take(area.height as usize).enumerate() {
-            buf.set_line(area.x, area.y + i as u16, line, area.width);
+            let y = area.y + i as u16;
+            if self.hscroll == 0 {
+                buf.set_line(area.x, y, line, area.width);
+            } else {
+                // Draw cell by cell, skipping the first `hscroll` columns.
+                let mut col = 0usize;
+                let mut x = area.x;
+                'spans: for span in &line.spans {
+                    let style = line.style.patch(span.style);
+                    for ch in span.content.chars() {
+                        let w = ch.width().unwrap_or(0);
+                        if col >= self.hscroll {
+                            if x + w as u16 > area.right() {
+                                break 'spans;
+                            }
+                            buf[(x, y)].set_char(ch).set_style(style);
+                            x += w as u16;
+                        }
+                        col += w;
+                    }
+                }
+            }
+            if line.width() > self.hscroll + area.width as usize && area.width > 0 {
+                buf[(area.right() - 1, y)].set_symbol("›").set_style(marker);
+            }
         }
     }
 
@@ -131,6 +172,25 @@ mod tests {
         d.view_height = 2;
         d.set_lines((0..10).map(|i| Line::raw(i.to_string())).collect());
         assert_eq!(d.scroll, 8);
+    }
+
+    #[test]
+    fn horizontal_scroll_and_overflow_marker() {
+        let mut d = DocSurface::new(vec![Line::raw("0123456789abcdefghij"), Line::raw("short")]);
+        let area = Rect::new(0, 0, 8, 2);
+        let mut buf = Buffer::empty(area);
+        d.render(&mut buf, area);
+        let row = |buf: &Buffer, y| (0..8).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>();
+        assert_eq!(row(&buf, 0), "0123456›", "cut-off lines are marked");
+        d.hscroll_by(10);
+        let mut buf = Buffer::empty(area);
+        d.render(&mut buf, area);
+        assert_eq!(row(&buf, 0), "abcdefg›");
+        assert_eq!(row(&buf, 1), "        ");
+        d.hscroll_by(100);
+        assert_eq!(d.hscroll, 12, "clamped to the widest line");
+        d.hscroll_by(-100);
+        assert_eq!(d.hscroll, 0);
     }
 
     #[test]

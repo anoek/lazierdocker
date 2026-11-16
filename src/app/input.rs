@@ -24,6 +24,8 @@ impl App {
             Event::Mouse(m) => self.handle_mouse(m),
             Event::Resize(w, h) => {
                 self.size = (w, h);
+                // Geometry changed under any drag: abort it.
+                self.drag = None;
                 self.dirty = true;
                 Vec::new()
             }
@@ -33,6 +35,9 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: String) -> Vec<Effect> {
+        if self.overlay.is_some() || !matches!(self.mode, Mode::Normal | Mode::Filter) {
+            return Vec::new();
+        }
         if self.mode == Mode::Filter {
             self.sidebar.filter.push_str(text.lines().next().unwrap_or(""));
             self.rebuild_rows();
@@ -58,6 +63,12 @@ impl App {
     }
 
     pub fn handle_key(&mut self, k: KeyEvent) -> Vec<Effect> {
+        let fx = self.handle_key_inner(k);
+        self.flush_deferred();
+        fx
+    }
+
+    fn handle_key_inner(&mut self, k: KeyEvent) -> Vec<Effect> {
         self.dirty = true;
         if self.overlay.is_some() {
             return self.overlay_key(k);
@@ -196,7 +207,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Enter | KeyCode::Tab => self.focus = Focus::Panes,
+            KeyCode::Enter | KeyCode::Tab => self.focus_inspector(),
             KeyCode::Char('/') => self.mode = Mode::Filter,
             KeyCode::Esc => {
                 if !self.sidebar.filter.is_empty() {
@@ -272,6 +283,8 @@ impl App {
             KeyCode::PageUp | KeyCode::Char('K') => self.scroll_pane(id, -page),
             KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_pane(id, page / 2),
             KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_pane(id, -page / 2),
+            KeyCode::Char('h') | KeyCode::Left => self.hscroll_pane(id, -8),
+            KeyCode::Char('l') | KeyCode::Right => self.hscroll_pane(id, 8),
             KeyCode::Home | KeyCode::Char('g') => self.scroll_pane_top(id),
             KeyCode::End | KeyCode::Char('G') => self.scroll_pane_end(id),
             KeyCode::Char(c) => {
@@ -282,6 +295,13 @@ impl App {
             _ => {}
         }
         Vec::new()
+    }
+
+    pub fn hscroll_pane(&mut self, id: crate::ui::layout::PaneId, delta: i32) {
+        if let Some(super::Pane { content: super::Content::Doc(d), .. }) = self.panes.get_mut(&id) {
+            d.hscroll_by(delta);
+            self.dirty = true;
+        }
     }
 
     fn scroll_pane_top(&mut self, id: crate::ui::layout::PaneId) {
@@ -363,6 +383,15 @@ impl App {
                 return;
             }
         }
+        self.focus_inspector();
+    }
+
+    /// Move focus to the panes, preferring the inspector over a shell (so
+    /// navigation keys don't land in a terminal by surprise).
+    pub fn focus_inspector(&mut self) {
+        if let Some(id) = self.primary_inspector() {
+            self.layout.focus = id;
+        }
         self.focus = Focus::Panes;
     }
 
@@ -375,8 +404,31 @@ impl App {
         double
     }
 
+    /// A mouse press ends keyboard modes: the filter is committed, resize,
+    /// copy and prefix modes are left (so the next keys go where the user clicked).
+    fn end_keyboard_mode(&mut self) {
+        match self.mode {
+            Mode::Normal => {}
+            Mode::Copy => {
+                self.copy = None;
+                self.selection = None;
+                self.mode = Mode::Normal;
+            }
+            Mode::Filter | Mode::Resize | Mode::Prefix => self.mode = Mode::Normal,
+        }
+    }
+
     pub fn handle_mouse(&mut self, m: MouseEvent) -> Vec<Effect> {
+        let fx = self.handle_mouse_inner(m);
+        self.flush_deferred();
+        fx
+    }
+
+    fn handle_mouse_inner(&mut self, m: MouseEvent) -> Vec<Effect> {
         let (col, row) = (m.column, m.row);
+        if matches!(m.kind, MouseEventKind::Down(_)) && self.overlay.is_none() {
+            self.end_keyboard_mode();
+        }
         if self.overlay.is_some() && self.drag.is_none() {
             return self.overlay_mouse(m);
         }
@@ -443,6 +495,19 @@ impl App {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => self.left_down(col, row),
             MouseEventKind::Down(MouseButton::Right) => self.right_down(col, row),
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+                if m.modifiers.contains(KeyModifiers::SHIFT)
+                    || matches!(m.kind, MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight) =>
+            {
+                let d = if matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft) { -8 } else { 8 };
+                if let Some((id, _, _)) = self.hits.panes.iter().find(|(_, r, _)| contains(*r, col, row)).cloned() {
+                    self.hscroll_pane(id, d);
+                }
+                Vec::new()
+            }
             MouseEventKind::ScrollUp => self.wheel(col, row, -3),
             MouseEventKind::ScrollDown => self.wheel(col, row, 3),
             _ => Vec::new(),

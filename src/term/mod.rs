@@ -75,7 +75,9 @@ pub fn normalise_lf(bytes: &[u8]) -> Vec<u8> {
 
 pub struct TermSurface {
     core: Arc<Mutex<Core>>,
-    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+    /// Bytes for the child, written by a dedicated thread so a child that
+    /// stops reading never blocks the UI.
+    writer: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     replies: Arc<Mutex<Vec<u8>>>,
     master: Option<Box<dyn MasterPty + Send>>,
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
@@ -157,8 +159,15 @@ impl TermSurface {
         let mut child = pair.slave.spawn_command(cmd).with_context(|| format!("spawning {}", argv.join(" ")))?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().context("pty reader")?;
-        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
-            Arc::new(Mutex::new(pair.master.take_writer().context("pty writer")?));
+        let mut pty_writer = pair.master.take_writer().context("pty writer")?;
+        let (writer, write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::Builder::new().name("pty-write".into()).spawn(move || {
+            while let Ok(bytes) = write_rx.recv() {
+                if pty_writer.write_all(&bytes).is_err() {
+                    break;
+                }
+            }
+        })?;
         me.killer = Some(child.clone_killer());
         me.master = Some(pair.master);
         me.writer = Some(writer.clone());
@@ -184,7 +193,7 @@ impl TermSurface {
                     }
                     let out = std::mem::take(&mut *replies.lock().expect("replies"));
                     if !out.is_empty() {
-                        let _ = writer.lock().expect("writer").write_all(&out);
+                        let _ = writer.send(out);
                     }
                     if !pending.swap(true, Ordering::AcqRel) {
                         wake();
@@ -231,7 +240,7 @@ impl TermSurface {
 
     fn write_child(&self, bytes: &[u8]) {
         if let Some(w) = &self.writer {
-            let _ = w.lock().expect("writer").write_all(bytes);
+            let _ = w.send(bytes.to_vec());
         }
     }
 
@@ -492,6 +501,30 @@ mod tests {
         .unwrap();
         t.resize(50, 7);
         assert!(wait_for(|| t.viewport_text().iter().any(|l| l.contains("7 50"))), "{:?}", t.viewport_text());
+    }
+
+    #[test]
+    fn writes_never_block_the_caller() {
+        // `sleep` never reads stdin, so the PTY input buffer fills up.
+        let t = TermSurface::spawn(
+            &["sh".into(), "-c".into(), "stty raw -echo; sleep 30".into()],
+            &[],
+            20,
+            5,
+            nop_wake(),
+            Arc::new(|_, _| {}),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let t = Arc::new(Mutex::new(t));
+        let t2 = t.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let big = "x".repeat(1 << 20);
+            t2.lock().unwrap().paste(&big);
+            let _ = done_tx.send(());
+        });
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).is_ok(), "paste blocked the caller");
     }
 
     #[test]

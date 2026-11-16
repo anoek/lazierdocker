@@ -1,0 +1,15 @@
+[package]
+name = "lazierdocker"
+version = "0.1.0"
+edition = "2021"
+description = "A mouse-first terminal UI for Docker"
+license = "MIT"
+
+[workspace]
+members = ["crates/ghostty-vt"]
+
+[dependencies]
+ghostty-vt = { path = "crates/ghostty-vt" }
+
+[profile.dev.package.ghostty-vt]
+opt-level = 1

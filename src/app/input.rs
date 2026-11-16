@@ -1,5 +1,6 @@
 //! Keyboard and mouse routing.
 
+use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -433,25 +434,22 @@ impl App {
                     sel.drag(pos);
                 }
             }
-            Drag::Project { name, moved } => {
+            Drag::Project { name, moved, row: last } => {
                 // Past the list's edges, scroll it and use its edge row.
                 let list = self.hits.sidebar.list_area;
                 let (rows, height) = (self.rows.len(), list.height as usize);
-                let row = if row < list.y {
+                let (at, direction) = if row < list.y {
                     self.sidebar.scroll_by(rows, height, -1);
-                    list.y
+                    (list.y, Ordering::Less)
                 } else if row >= list.bottom() {
                     self.sidebar.scroll_by(rows, height, 1);
-                    list.bottom().saturating_sub(1)
+                    (list.bottom().saturating_sub(1), Ordering::Greater)
                 } else {
-                    row
+                    (row, row.cmp(&last))
                 };
-                let onto = self.project_at_row(row);
-                if onto.is_some_and(|onto| self.move_project(&name, &onto)) {
-                    self.drag = Some(Drag::Project { name, moved: true });
-                } else {
-                    self.drag = Some(Drag::Project { name, moved });
-                }
+                let onto = self.project_at_row(at);
+                let moved = onto.is_some_and(|onto| self.move_project(&name, &onto, direction)) || moved;
+                self.drag = Some(Drag::Project { name, moved, row });
             }
             Drag::SidebarWidth => {
                 let max = MAX_WIDTH.min(self.size.0.saturating_sub(20)).max(MIN_WIDTH);
@@ -543,7 +541,7 @@ impl App {
                 self.rebuild_rows();
             } else if let NodeKey::Project(name) = key {
                 // Dragging a project moves it among the others.
-                self.drag = Some(Drag::Project { name, moved: false });
+                self.drag = Some(Drag::Project { name, moved: false, row });
             }
             return Vec::new();
         }

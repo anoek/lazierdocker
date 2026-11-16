@@ -1929,6 +1929,40 @@ mod project_order {
     }
 
     #[test]
+    fn dragging_a_short_group_past_a_tall_one_does_not_flip_back() {
+        // alpha has 1 service, bravo 3: after alpha moves below bravo, the
+        // pointer is over bravo's services, above alpha.
+        let mut containers = vec![container("alpha-app-1", ContainerState::Running, Some(("alpha", "app")))];
+        for s in ["api", "db", "web"] {
+            containers.push(container(&format!("bravo-{s}-1"), ContainerState::Running, Some(("bravo", s))));
+        }
+        let snap = Snapshot { projects: derive_projects(&containers, None), containers, ..Default::default() };
+        let mut app = App::new("tcp://test");
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snap)));
+        draw(&mut app, 120, 30);
+        let (alpha, bravo) = (row_of(&app, "alpha"), row_of(&app, "bravo"));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 4, alpha));
+        // Each step down, with a frame drawn between events as in the app.
+        for row in alpha + 1..=bravo + 2 {
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4, row));
+            draw(&mut app, 120, 30);
+            if row >= bravo {
+                assert_eq!(names(&app), ["bravo", "alpha"], "row {row}: stays put once moved");
+            }
+        }
+        // Holding still (repeated events at one cell) changes nothing either.
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4, bravo + 2));
+        draw(&mut app, 120, 30);
+        assert_eq!(names(&app), ["bravo", "alpha"]);
+        // Dragging back up past bravo moves it back.
+        for row in (1..bravo + 2).rev() {
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4, row));
+            draw(&mut app, 120, 30);
+        }
+        assert_eq!(names(&app), ["alpha", "bravo"]);
+    }
+
+    #[test]
     fn a_saved_order_applies_from_the_first_snapshot() {
         let mut app = App::new("tcp://test");
         app.project_order = vec!["bravo".into(), "gone".into(), "alpha".into()];

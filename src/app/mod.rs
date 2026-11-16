@@ -72,10 +72,12 @@ pub enum Drag {
     TermMouse(PaneId),
     /// Selecting text in a pane.
     Select(PaneId),
-    /// Moving a project in the sidebar; `moved` once its place changed.
+    /// Moving a project in the sidebar; `moved` once its place changed;
+    /// `row`: the pointer's last row (the drag's direction).
     Project {
         name: String,
         moved: bool,
+        row: u16,
     },
 }
 

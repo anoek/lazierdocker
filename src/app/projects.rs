@@ -3,6 +3,8 @@
 //! bulk menu) and is saved between runs. Projects not placed yet follow the
 //! placed ones, in their usual order (the local project first, then by name).
 
+use std::cmp::Ordering;
+
 use super::App;
 use crate::ui::sidebar::NodeKey;
 
@@ -14,16 +16,21 @@ impl App {
         self.snap.projects.sort_by_key(|p| rank(&p.name));
     }
 
-    /// Put project `name` where `onto` is, shifting the others. False if
-    /// nothing moved.
-    pub(super) fn move_project(&mut self, name: &str, onto: &str) -> bool {
+    /// Put project `name` where `onto` is, shifting the others, if `onto`
+    /// lies in the pointer's `direction` (Greater: down). False if nothing
+    /// moved.
+    ///
+    /// Following the direction keeps groups of different heights from
+    /// swapping back and forth: once a short group moves below a tall one, the
+    /// tall one slides up under the pointer, but it is behind the drag now.
+    pub(super) fn move_project(&mut self, name: &str, onto: &str, direction: Ordering) -> bool {
         let projects = &mut self.snap.projects;
         let (Some(from), Some(to)) =
             (projects.iter().position(|p| p.name == name), projects.iter().position(|p| p.name == onto))
         else {
             return false;
         };
-        if from == to {
+        if to.cmp(&from) != direction || direction == Ordering::Equal {
             return false;
         }
         let project = projects.remove(from);

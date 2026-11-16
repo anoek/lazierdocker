@@ -160,6 +160,11 @@ impl Runtime {
         match effect {
             Effect::Quit => app.quit = true,
             Effect::RefreshNow => self.refresher.poke(),
+            Effect::Copy(text) => {
+                let how = crate::clipboard::copy(&text);
+                let n = text.chars().count();
+                app.flash(format!("copied {n} chars ({how})"));
+            }
             Effect::Load { pane, key, spec } => {
                 let docker = self.docker.clone();
                 let tx = self.tx.clone();

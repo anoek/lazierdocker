@@ -479,3 +479,110 @@ mod exits {
         assert!(t.viewport_text().join("").contains("code 1"));
     }
 }
+
+mod overlays {
+    use super::*;
+    use crate::app::actions::Action;
+    use crate::app::overlay::{Menu, MenuItem, Overlay};
+
+    fn menu_app() -> App {
+        let mut app = loaded_app();
+        draw(&mut app, 100, 30);
+        app.overlay = Some(Overlay::Menu(Menu::new(
+            "t",
+            vec![
+                MenuItem::new("one", Action::None),
+                MenuItem::new("quit", Action::Quit).key("Q"),
+                MenuItem::new("three", Action::None),
+            ],
+        )));
+        draw(&mut app, 100, 30);
+        app
+    }
+
+    #[test]
+    fn menu_keyboard_navigation() {
+        let mut app = menu_app();
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        let Some(Overlay::Menu(m)) = &app.overlay else { panic!() };
+        assert_eq!(m.highlighted, 0, "wraps");
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Effect::Quit]);
+        assert!(app.overlay.is_none());
+        // Shortcut key activates directly.
+        let mut app = menu_app();
+        assert_eq!(app.handle_key(key(KeyCode::Char('Q'))), vec![Effect::Quit]);
+    }
+
+    #[test]
+    fn menu_mouse_hover_and_click() {
+        let mut app = menu_app();
+        let (r, _) = app.overlay_hits.rows[2];
+        app.handle_mouse(mouse(MouseEventKind::Moved, r.x + 1, r.y));
+        let Some(Overlay::Menu(m)) = &app.overlay else { panic!() };
+        assert_eq!(m.highlighted, 2);
+        let (r, _) = app.overlay_hits.rows[1];
+        assert_eq!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), r.x + 1, r.y)), vec![Effect::Quit]);
+    }
+
+    #[test]
+    fn click_outside_closes() {
+        let mut app = menu_app();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        assert!(app.overlay.is_none());
+        // ...and the click didn't fall through to the sidebar.
+        assert_eq!(app.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn confirm_y_runs_action() {
+        let mut app = loaded_app();
+        app.overlay =
+            Some(Overlay::Confirm { title: "Quit?".into(), body: "sure".into(), danger: true, action: Action::Quit });
+        let s = screen(&draw(&mut app, 100, 30));
+        assert!(s.contains("↵ confirm") && s.contains("esc cancel"), "{s}");
+        assert!(app.handle_key(key(KeyCode::Char('n'))).is_empty());
+        assert!(app.overlay.is_none());
+        app.overlay =
+            Some(Overlay::Confirm { title: "Quit?".into(), body: "sure".into(), danger: true, action: Action::Quit });
+        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), vec![Effect::Quit]);
+    }
+
+    #[test]
+    fn context_menu_clamped_on_screen() {
+        let mut app = loaded_app();
+        let buf = draw(&mut app, 100, 30);
+        let y = (0..30).find(|y| row_text(&buf, *y).contains("loner")).unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 5, y));
+        let Some(Overlay::Menu(m)) = &app.overlay else { panic!() };
+        assert!(m.items.iter().any(|i| i.label == "Exec shell"));
+        assert_eq!(app.selected().map(|k| app.target_label(k)), Some("loner".into()), "right-click selects");
+        // Right-click on a pane near the bottom-right corner: pane menu, kept on screen.
+        app.overlay = None;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 98, 27));
+        let Some(Overlay::Menu(m)) = &app.overlay else { panic!() };
+        assert!(m.items.iter().any(|i| i.label == "Split right"));
+        draw(&mut app, 100, 30);
+        let p = app.overlay_hits.panel;
+        assert!(p.right() <= 100 && p.bottom() <= 30 && p.width > 10, "{p:?}");
+    }
+
+    #[test]
+    fn help_filters() {
+        let mut app = loaded_app();
+        draw(&mut app, 100, 40);
+        app.handle_key(key(KeyCode::Char('?')));
+        for c in "zoom".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        let s = screen(&draw(&mut app, 100, 40));
+        assert!(s.contains("zoom") && !s.contains("restart"), "{s}");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.overlay.is_some(), "first esc clears the filter");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.overlay.is_none());
+    }
+}

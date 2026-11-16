@@ -85,6 +85,7 @@ impl App {
 
         self.render_status(buf, status_area);
         self.hits = hits;
+        self.render_overlay(buf, area);
     }
 
     pub fn pane_title(&self, id: PaneId) -> String {

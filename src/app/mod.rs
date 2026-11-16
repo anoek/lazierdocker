@@ -4,9 +4,11 @@
 //! effects (docker calls, spawning processes, clipboard) and feeds results back
 //! as [`AppEvent`]s.
 
+pub mod actions;
 pub mod input;
 pub mod inspect;
 pub mod loader;
+pub mod overlay;
 pub mod panes;
 pub mod render;
 pub mod run;
@@ -92,6 +94,8 @@ pub enum Effect {
     },
     /// Keep one stats stream per running container.
     SyncStats(Vec<String>),
+    /// Put text on the system clipboard.
+    Copy(String),
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +179,8 @@ pub struct App {
     pub cursor: Option<(u16, u16)>,
     /// Transient status message.
     pub toast: Option<(String, Instant)>,
+    pub overlay: Option<overlay::Overlay>,
+    pub overlay_hits: overlay::OverlayHits,
     pub size: (u16, u16),
     pub dirty: bool,
     pub quit: bool,
@@ -209,6 +215,8 @@ impl App {
             tick: 0,
             cursor: None,
             toast: None,
+            overlay: None,
+            overlay_hits: overlay::OverlayHits::default(),
             size: (80, 24),
             dirty: true,
             quit: false,

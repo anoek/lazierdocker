@@ -2,6 +2,7 @@
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
 pub mod app;
+pub mod clipboard;
 pub mod doc;
 pub mod docker;
 pub mod event;

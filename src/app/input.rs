@@ -59,6 +59,9 @@ impl App {
 
     pub fn handle_key(&mut self, k: KeyEvent) -> Vec<Effect> {
         self.dirty = true;
+        if self.overlay.is_some() {
+            return self.overlay_key(k);
+        }
         match self.mode {
             Mode::Prefix => {
                 self.mode = Mode::Normal;
@@ -99,6 +102,7 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.focus_dir(area, Dir4::Up),
             KeyCode::Char('j') | KeyCode::Down => self.focus_dir(area, Dir4::Down),
             KeyCode::Char('z') => self.layout.toggle_zoom(),
+            KeyCode::Char('?') => return self.perform(super::actions::Action::Help),
             KeyCode::Char('v') | KeyCode::Char('%') => self.split_focused(SplitDir::Horizontal),
             KeyCode::Char('-') | KeyCode::Char('"') => self.split_focused(SplitDir::Vertical),
             KeyCode::Char('x') => self.close_pane(self.layout.focus),
@@ -165,6 +169,7 @@ impl App {
         let page = self.hits.sidebar.list_area.height.max(1) as i32;
         match k.code {
             KeyCode::Char('q') => return vec![Effect::Quit],
+            KeyCode::Char('x') | KeyCode::Char('?') => return self.perform(super::actions::Action::Help),
             KeyCode::Char('j') | KeyCode::Down => self.sidebar.move_selection(&rows, 1),
             KeyCode::Char('k') | KeyCode::Up => self.sidebar.move_selection(&rows, -1),
             KeyCode::PageDown => self.sidebar.move_selection(&rows, page),
@@ -221,6 +226,7 @@ impl App {
     /// Per-item lazydocker keys, from the sidebar or a pane showing the item.
     pub fn item_key(&mut self, c: char, target: &NodeKey) -> Vec<Effect> {
         match c {
+            'x' | '?' => self.perform(super::actions::Action::Help),
             'E' => self.exec_shell(target),
             'a' => self.attach(target),
             'm' => {
@@ -361,6 +367,9 @@ impl App {
 
     pub fn handle_mouse(&mut self, m: MouseEvent) -> Vec<Effect> {
         let (col, row) = (m.column, m.row);
+        if self.overlay.is_some() && self.drag.is_none() {
+            return self.overlay_mouse(m);
+        }
         // Active drags take every event until release.
         if let Some(Drag::TermMouse(pane)) = self.drag.clone() {
             let action = match m.kind {
@@ -394,6 +403,7 @@ impl App {
         }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => self.left_down(col, row),
+            MouseEventKind::Down(MouseButton::Right) => self.right_down(col, row),
             MouseEventKind::ScrollUp => self.wheel(col, row, -3),
             MouseEventKind::ScrollDown => self.wheel(col, row, 3),
             _ => Vec::new(),
@@ -504,6 +514,25 @@ impl App {
         if let Some((id, _, _)) = self.hits.panes.iter().find(|(_, r, _)| contains(*r, col, row)).cloned() {
             self.focus = Focus::Panes;
             self.layout.focus = id;
+        }
+        Vec::new()
+    }
+
+    /// Right-click: context menu for the sidebar item or pane under the pointer.
+    fn right_down(&mut self, col: u16, row: u16) -> Vec<Effect> {
+        if let Some((_, key)) = self.hits.sidebar.rows.iter().find(|(r, _)| contains(*r, col, row)).cloned() {
+            let rows = self.rows.clone();
+            self.sidebar.select(&rows, &key);
+            self.focus = Focus::Sidebar;
+            self.overlay = Some(super::overlay::Overlay::Menu(self.item_menu(&key).at(col, row)));
+            self.dirty = true;
+            return Vec::new();
+        }
+        if let Some((id, _, _)) = self.hits.panes.iter().find(|(_, r, _)| contains(*r, col, row)).cloned() {
+            self.layout.focus = id;
+            self.focus = Focus::Panes;
+            self.overlay = Some(super::overlay::Overlay::Menu(self.pane_menu(id).at(col, row)));
+            self.dirty = true;
         }
         Vec::new()
     }

@@ -8,6 +8,8 @@ services:
     environment: [GREETING=hello]
   worker:
     image: alpine:3.20
+    deploy:
+      replicas: 2
     command: sh -c 'i=0; while true; do i=$$((i+1)); printf "\033[32mtick\033[0m %s\n" $$i; sleep 1; done'
   db:
     image: redis:7-alpine

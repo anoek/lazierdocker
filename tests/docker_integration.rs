@@ -20,6 +20,8 @@ async fn snapshot_sees_demo_project() {
     let demo = snap.project("demo").expect("demo project");
     let names: Vec<_> = demo.services.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, vec!["db", "web", "worker"]);
+    let worker = snap.service("demo", "worker").unwrap();
+    assert_eq!(worker.replicas.len(), 2, "the fixture scales worker to 2");
     assert!(snap.containers.iter().any(|c| c.name == "loner"));
     assert!(snap.standalone_containers().any(|c| c.name == "exited"));
     assert!(snap.images.iter().any(|i| i.name == "nginx"));
@@ -60,4 +62,23 @@ fn exec_shell_script_works_without_passwd_entry() {
         let out = child.wait_with_output().unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).contains("shell-alive"), "user {user}: {out:?}");
     }
+}
+
+/// Two replicas' histories merge into one time-ordered log.
+#[tokio::test]
+async fn replica_histories_merge_in_time_order() {
+    use lazierdocker::docker::logs::{history, merge};
+    let Some(host) = test_host() else { return };
+    let docker = Docker::connect_to(&host).unwrap();
+    let snap = docker.snapshot(None).await.unwrap();
+    let worker = snap.service("demo", "worker").unwrap();
+    let mut histories = Vec::new();
+    for id in &worker.replicas {
+        histories.push(history(&docker, id, "50").await.unwrap());
+    }
+    assert!(histories.iter().all(|h| !h.is_empty()), "both replicas print a tick a second");
+    let merged = merge(histories, Some(60));
+    assert_eq!(merged.len(), 60);
+    assert!(merged.windows(2).all(|w| w[0].1.time <= w[1].1.time), "time order");
+    assert!(merged.iter().any(|(src, _)| *src == 0) && merged.iter().any(|(src, _)| *src == 1), "interleaved");
 }

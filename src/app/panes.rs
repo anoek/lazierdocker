@@ -6,11 +6,12 @@ use std::collections::HashMap;
 use ratatui::text::Line;
 
 use super::inspect::{self, kind_of, tabs_for, Tab};
+use super::logs::LogStream;
 use super::{App, Effect, Focus};
 use crate::doc::DocSurface;
 use crate::term::TermSurface;
 use crate::ui::layout::{PaneId, SplitDir};
-use crate::ui::sidebar::{section_of, NodeKey};
+use crate::ui::sidebar::{ancestors, NodeKey};
 
 #[derive(Debug, Clone)]
 pub enum PaneKind {
@@ -107,15 +108,15 @@ pub struct Pane {
     pub tabs: HashMap<inspect::TargetKind, inspect::Tab>,
     pub content: Content,
     pub loaded: Option<inspect::ContentKey>,
-    /// Background task feeding this pane (log stream); aborted when replaced.
-    pub task: Option<tokio::task::AbortHandle>,
+    /// Background tasks feeding this pane (log streams); aborted when the
+    /// content is replaced.
+    tasks: Vec<tokio::task::AbortHandle>,
     /// A Load for `loaded` is outstanding.
     pub inflight: bool,
     /// Tick of the last Load (periodic refresh of Top).
     pub refreshed_at: u64,
-    /// The log stream for `loaded` ended cleanly at this snapshot generation;
-    /// it resumes once a newer snapshot shows the container running.
-    pub logs_ended_at: Option<u64>,
+    /// Per container: the log stream of a Logs view.
+    pub logs: HashMap<String, LogStream>,
     /// Logs show the whole history instead of the last lines (until the
     /// pane shows something else).
     pub full_logs: bool,
@@ -130,24 +131,30 @@ impl Pane {
             tabs: HashMap::new(),
             content: Content::Doc(DocSurface::default()),
             loaded: None,
-            task: None,
+            tasks: Vec::new(),
             inflight: false,
             refreshed_at: 0,
-            logs_ended_at: None,
+            logs: HashMap::new(),
             full_logs: false,
             reload: false,
         }
     }
 
-    pub fn stop_task(&mut self) {
-        if let Some(t) = self.task.take() {
+    /// A task feeding the current content.
+    pub fn add_task(&mut self, task: tokio::task::AbortHandle) {
+        self.tasks.retain(|t| !t.is_finished());
+        self.tasks.push(task);
+    }
+
+    pub fn stop_tasks(&mut self) {
+        for t in self.tasks.drain(..) {
             t.abort();
         }
     }
 
     /// Replace the content, stopping whatever fed the old one.
     pub fn set_content(&mut self, content: Content) {
-        self.stop_task();
+        self.stop_tasks();
         self.content = content;
     }
 
@@ -162,7 +169,7 @@ impl Pane {
 
 impl Drop for Pane {
     fn drop(&mut self) {
-        self.stop_task();
+        self.stop_tasks();
     }
 }
 
@@ -285,9 +292,9 @@ impl App {
         if self.rows.iter().any(|r| &r.key == key) {
             return true;
         }
-        let mut opened = self.sidebar.set_expanded(&NodeKey::Section(section_of(key)), true);
-        if let NodeKey::Service(p, _) = key {
-            opened |= self.sidebar.set_expanded(&NodeKey::Project(p.clone()), true);
+        let mut opened = false;
+        for group in ancestors(key, &self.snap) {
+            opened |= self.sidebar.set_expanded(&group, true);
         }
         if opened {
             self.rebuild_rows();
@@ -322,7 +329,7 @@ impl App {
 
     /// (id, name) of the running container behind `key`; flashes why not otherwise.
     fn running_container(&mut self, key: &NodeKey) -> Option<(String, String)> {
-        let c = self.target_container(key)?;
+        let c = self.primary_container(key)?;
         let (id, name) = (c.id.clone(), c.name.clone());
         if !c.is_running() {
             self.flash(format!("{name} is not running"));

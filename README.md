@@ -12,7 +12,10 @@ clipboard. Shells, `docker attach` and logs run in embedded terminals powered by
 
 **Resources (lazydocker parity)**
 - **Compose projects:** discovered from container labels, plus the compose project in the current directory (marked ●).
-- **Services:** with the status of their containers.
+- **Services:** with the status of their containers. A service scaled to several containers (`deploy.replicas`,
+  `--scale`) expands to one row per replica. Its own row combines them: logs from every replica interleaved in
+  time order with a label per replica, summed CPU and memory, and the processes of all replicas. Env and
+  Config show the first replica.
 - **Other resources:** standalone containers, images, volumes and networks, each in a collapsible section of the
   sidebar tree. Projects can also be collapsed.
 - **Inspector tabs:**
@@ -43,8 +46,9 @@ clipboard. Shells, `docker attach` and logs run in embedded terminals powered by
   - Attached compose commands (rebuild, pull, …) also run in a pane.
   - Keys, mouse, paste (bracketed) and scrollback all work. `ctrl+b` is the only key the app keeps.
 - **Logs:**
-  - Container logs open with the last 1000 lines and follow new output. `f` loads the full history.
-  - When a container restarts, its log stream resumes on its own.
+  - Container and service logs open with the last 1000 lines and follow new output. `f` loads the full history.
+  - When a container restarts, its new output is added below the old. A replica added by scaling up joins the
+    service's logs.
   - `/` or `ctrl+f` finds text in a logs pane. Matches are highlighted and update as new lines arrive. `n` / `N`
     step to older / newer matches.
 - **Copy and paste:**

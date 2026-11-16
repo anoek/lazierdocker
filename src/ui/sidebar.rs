@@ -62,6 +62,8 @@ pub struct Row {
     pub expandable: bool,
     pub expanded: bool,
     pub last_child: bool,
+    /// The parent row is its group's last child (for tree guide lines).
+    pub parent_last: bool,
     /// Text used for filtering and as the default label.
     pub label: String,
 }
@@ -75,11 +77,14 @@ pub struct SidebarHits {
 
 #[derive(Debug, Clone)]
 pub struct Sidebar {
-    pub collapsed: HashSet<NodeKey>,
+    /// Groups the user expanded or collapsed away from their default.
+    toggled: HashSet<NodeKey>,
     pub selected: Option<NodeKey>,
     /// Index of the selection in the last computed rows, used to pick a
     /// neighbour when the selected item disappears.
     pub selected_index: usize,
+    /// Section of the selection, for the same purpose.
+    selected_section: Option<Section>,
     pub scroll: usize,
     /// The selection (key and row) last scrolled into view (see `render`).
     revealed: Option<(NodeKey, usize)>,
@@ -94,14 +99,11 @@ pub const MAX_WIDTH: u16 = 80;
 
 impl Default for Sidebar {
     fn default() -> Self {
-        let mut collapsed = HashSet::new();
-        collapsed.insert(NodeKey::Section(Section::Images));
-        collapsed.insert(NodeKey::Section(Section::Volumes));
-        collapsed.insert(NodeKey::Section(Section::Networks));
         Self {
-            collapsed,
+            toggled: HashSet::new(),
             selected: None,
             selected_index: 0,
+            selected_section: None,
             scroll: 0,
             revealed: None,
             filter: String::new(),
@@ -111,15 +113,47 @@ impl Default for Sidebar {
     }
 }
 
-pub fn section_of(key: &NodeKey) -> Section {
+/// Groups start expanded, except the long resource lists and replicated
+/// services (whose row already shows their replicas combined).
+fn expanded_by_default(key: &NodeKey) -> bool {
+    !matches!(key, NodeKey::Section(Section::Images | Section::Volumes | Section::Networks) | NodeKey::Service(..))
+}
+
+/// (project, service) of a container listed under its replicated service.
+fn replica_of<'a>(id: &str, snap: &'a Snapshot) -> Option<(&'a str, &'a str)> {
+    let c = snap.container(id)?;
+    let (p, s) = (c.project.as_deref()?, c.service.as_deref()?);
+    let svc = snap.service(p, s)?;
+    (svc.is_replicated() && svc.replicas.iter().any(|r| r == id)).then_some((p, s))
+}
+
+/// The groups holding `key`'s row, outermost first (none for a section).
+pub fn ancestors(key: &NodeKey, snap: &Snapshot) -> Vec<NodeKey> {
+    let section = |s| NodeKey::Section(s);
     match key {
-        NodeKey::Section(s) => *s,
-        NodeKey::Project(_) | NodeKey::Service(..) => Section::Projects,
-        NodeKey::Container(_) => Section::Containers,
-        NodeKey::Image(_) => Section::Images,
-        NodeKey::Volume(_) => Section::Volumes,
-        NodeKey::Network(_) => Section::Networks,
+        NodeKey::Section(_) => vec![],
+        NodeKey::Project(_) => vec![section(Section::Projects)],
+        NodeKey::Service(p, _) => vec![section(Section::Projects), NodeKey::Project(p.clone())],
+        NodeKey::Container(id) => match replica_of(id, snap) {
+            Some((p, s)) => vec![
+                section(Section::Projects),
+                NodeKey::Project(p.to_string()),
+                NodeKey::Service(p.to_string(), s.to_string()),
+            ],
+            None => vec![section(Section::Containers)],
+        },
+        NodeKey::Image(_) => vec![section(Section::Images)],
+        NodeKey::Volume(_) => vec![section(Section::Volumes)],
+        NodeKey::Network(_) => vec![section(Section::Networks)],
     }
+}
+
+/// The section a row is in.
+fn section_at(rows: &[Row], i: usize) -> Option<Section> {
+    rows[..=i.min(rows.len().checked_sub(1)?)].iter().rev().find_map(|r| match r.key {
+        NodeKey::Section(s) => Some(s),
+        _ => None,
+    })
 }
 
 /// Standalone containers the Containers section lists (`e` hides exited ones).
@@ -135,7 +169,7 @@ struct TreeItem {
 
 impl TreeItem {
     fn leaf(key: NodeKey, depth: u8, label: String) -> Self {
-        let row = Row { key, depth, expandable: false, expanded: false, last_child: false, label };
+        let row = Row { key, depth, expandable: false, expanded: false, last_child: false, parent_last: false, label };
         Self { row, children: Vec::new() }
     }
 
@@ -168,7 +202,18 @@ fn tree(snap: &Snapshot, show_exited: bool) -> Vec<TreeItem> {
                         let services = p
                             .services
                             .iter()
-                            .map(|s| leaf(NodeKey::Service(p.name.clone(), s.name.clone()), 2, s.name.clone()))
+                            .map(|s| {
+                                let key = NodeKey::Service(p.name.clone(), s.name.clone());
+                                if !s.is_replicated() {
+                                    return leaf(key, 2, s.name.clone());
+                                }
+                                let replicas = snap
+                                    .replicas(s)
+                                    .filter(|c| show_exited || c.state != ContainerState::Exited)
+                                    .map(|c| leaf(NodeKey::Container(c.id.clone()), 3, c.name.clone()))
+                                    .collect();
+                                TreeItem::branch(key, 2, s.name.clone(), replicas)
+                            })
                             .collect();
                         TreeItem::branch(NodeKey::Project(p.name.clone()), 1, p.name.clone(), services)
                     })
@@ -193,7 +238,7 @@ fn tree(snap: &Snapshot, show_exited: bool) -> Vec<TreeItem> {
 
 impl Sidebar {
     fn is_expanded(&self, key: &NodeKey) -> bool {
-        !self.filter.is_empty() || !self.collapsed.contains(key)
+        !self.filter.is_empty() || expanded_by_default(key) != self.toggled.contains(key)
     }
 
     /// Flatten the visible tree.
@@ -202,14 +247,15 @@ impl Sidebar {
         let mut out = Vec::new();
         // Sections stay visible while filtering so the tree keeps its shape.
         for section in tree(snap, self.show_exited) {
-            self.emit(section, &needle, false, &mut out);
+            self.emit(section, &needle, false, false, &mut out);
         }
         out
     }
 
-    fn emit(&self, item: TreeItem, needle: &str, last_child: bool, out: &mut Vec<Row>) {
+    fn emit(&self, item: TreeItem, needle: &str, last_child: bool, parent_last: bool, out: &mut Vec<Row>) {
         let TreeItem { mut row, children } = item;
         row.last_child = last_child;
+        row.parent_last = parent_last;
         row.expanded = row.expandable && self.is_expanded(&row.key);
         // While filtering, a matching group (not a section) shows all its children.
         let show_all = row.depth > 0 && !needle.is_empty() && row.label.to_lowercase().contains(needle);
@@ -221,7 +267,7 @@ impl Sidebar {
         let kids: Vec<TreeItem> = children.into_iter().filter(|c| show_all || c.matches(needle)).collect();
         let n = kids.len();
         for (i, c) in kids.into_iter().enumerate() {
-            self.emit(c, needle, i + 1 == n, out);
+            self.emit(c, needle, i + 1 == n, last_child, out);
         }
     }
 
@@ -236,12 +282,13 @@ impl Sidebar {
         if let Some(sel) = &self.selected {
             if let Some(i) = rows.iter().position(|r| &r.key == sel) {
                 self.selected_index = i;
+                self.selected_section = section_at(rows, i);
                 return;
             }
         }
         // The item vanished: pick the row now at its old position, kept within
         // the same section, falling back to that section's header.
-        let i = match self.selected.as_ref().map(section_of) {
+        let i = match self.selected.as_ref().and(self.selected_section) {
             Some(section) => {
                 let start = rows.iter().position(|r| r.key == NodeKey::Section(section)).unwrap_or(0);
                 let end =
@@ -254,8 +301,13 @@ impl Sidebar {
             }
             None => self.selected_index.min(rows.len() - 1),
         };
+        self.set_selection(rows, i);
+    }
+
+    fn set_selection(&mut self, rows: &[Row], i: usize) {
         self.selected = Some(rows[i].key.clone());
         self.selected_index = i;
+        self.selected_section = section_at(rows, i);
     }
 
     pub fn move_selection(&mut self, rows: &[Row], delta: i32) {
@@ -264,29 +316,27 @@ impl Sidebar {
         }
         let cur = self.selected.as_ref().and_then(|k| rows.iter().position(|r| &r.key == k)).unwrap_or(0) as i64;
         let next = (cur + delta as i64).clamp(0, rows.len() as i64 - 1) as usize;
-        self.selected = Some(rows[next].key.clone());
-        self.selected_index = next;
+        self.set_selection(rows, next);
     }
 
     pub fn select(&mut self, rows: &[Row], key: &NodeKey) {
         if let Some(i) = rows.iter().position(|r| &r.key == key) {
-            self.selected = Some(key.clone());
-            self.selected_index = i;
+            self.set_selection(rows, i);
         }
     }
 
     pub fn toggle(&mut self, key: &NodeKey) {
-        if !self.collapsed.remove(key) {
-            self.collapsed.insert(key.clone());
+        if !self.toggled.remove(key) {
+            self.toggled.insert(key.clone());
         }
     }
 
     /// Expand or collapse a group; true if that changed it.
     pub fn set_expanded(&mut self, key: &NodeKey, expanded: bool) -> bool {
-        if expanded {
-            self.collapsed.remove(key)
+        if expanded == expanded_by_default(key) {
+            self.toggled.remove(key)
         } else {
-            self.collapsed.insert(key.clone())
+            self.toggled.insert(key.clone())
         }
     }
 
@@ -443,6 +493,7 @@ fn row_spans(
     let snap = ctx.snap;
     let caret = |expanded: bool| if expanded { "▾ " } else { "▸ " };
     let dim = Style::default().fg(t.overlay0);
+    let guide = Style::default().fg(t.surface1);
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut right = None;
     let mut toggle = None;
@@ -467,13 +518,7 @@ fn row_spans(
             let project = snap.project(name);
             spans.push(Span::styled(name.clone(), Style::default().fg(t.text)));
             if let Some(p) = project {
-                let running = p
-                    .services
-                    .iter()
-                    .filter(|s| {
-                        s.container_id.as_deref().and_then(|id| snap.container(id)).is_some_and(|c| c.is_running())
-                    })
-                    .count();
+                let running = p.services.iter().filter(|s| snap.primary(s).is_some_and(|c| c.is_running())).count();
                 spans.push(Span::styled(format!(" {running}/{}", p.services.len()), dim));
                 if p.local {
                     spans.push(Span::styled(" ●", Style::default().fg(t.mauve)));
@@ -482,10 +527,29 @@ fn row_spans(
         }
         NodeKey::Service(project, name) => {
             let prefix = if row.last_child { "   └ " } else { "   ├ " };
-            spans.push(Span::styled(prefix, Style::default().fg(t.surface1)));
-            let c =
-                snap.service(project, name).and_then(|s| s.container_id.as_deref()).and_then(|id| snap.container(id));
-            match c {
+            spans.push(Span::styled(prefix, guide));
+            let svc = snap.service(project, name);
+            if row.expandable {
+                // Replicated: a group of replica rows, with their running count and total CPU.
+                toggle = Some(prefix.chars().count() as u16);
+                spans.push(Span::styled(caret(row.expanded).to_string(), Style::default().fg(t.accent)));
+                spans.push(Span::styled(name.clone(), Style::default().fg(t.text)));
+                if let Some(svc) = svc {
+                    let replicas: Vec<&Container> = snap.replicas(svc).collect();
+                    let running = replicas.iter().filter(|c| c.is_running()).count();
+                    spans.push(Span::styled(format!(" {running}/{}", replicas.len()), dim));
+                    let cpu: Vec<f64> = replicas
+                        .iter()
+                        .filter(|c| c.state == ContainerState::Running)
+                        .filter_map(|c| ctx.cpu.get(&c.id).copied())
+                        .collect();
+                    if !cpu.is_empty() {
+                        right = Some(present::cpu_span(cpu.iter().sum(), t));
+                    }
+                }
+                return (spans, right, toggle);
+            }
+            match svc.and_then(|s| snap.primary(s)) {
                 Some(c) => right = container_spans(c, name.clone(), ctx, &mut spans),
                 None => {
                     spans.push(Span::styled("·", Style::default().fg(t.blue)));
@@ -495,7 +559,14 @@ fn row_spans(
             }
         }
         NodeKey::Container(id) => {
-            spans.push(Span::raw("  "));
+            if row.depth == 3 {
+                // A replica, under its service.
+                let stem = if row.parent_last { "     " } else { "   │ " };
+                let branch = if row.last_child { "└ " } else { "├ " };
+                spans.push(Span::styled(format!("{stem}{branch}"), guide));
+            } else {
+                spans.push(Span::raw("  "));
+            }
             if let Some(c) = snap.container(id) {
                 right = container_spans(c, c.name.clone(), ctx, &mut spans);
             }
@@ -658,6 +729,96 @@ mod tests {
             Sidebar::parent_of(&rows, &NodeKey::Service("demo".into(), "web".into())),
             Some(NodeKey::Project("demo".into()))
         );
+    }
+
+    /// demo: web scaled to 3 (replica 3 exited), db single.
+    fn replicated() -> Snapshot {
+        use crate::docker::model::tests::replica;
+        let containers = vec![
+            replica("demo", "web", 1, ContainerState::Running),
+            replica("demo", "web", 2, ContainerState::Running),
+            replica("demo", "web", 3, ContainerState::Exited),
+            replica("demo", "db", 1, ContainerState::Running),
+        ];
+        Snapshot { projects: derive_projects(&containers, None), containers, ..Default::default() }
+    }
+
+    #[test]
+    fn replicated_services_expand_to_their_replicas() {
+        let s = replicated();
+        let mut sb = Sidebar::default();
+        let rows = sb.rows(&s);
+        let web = NodeKey::Service("demo".into(), "web".into());
+        let row = rows.iter().find(|r| r.key == web).unwrap();
+        assert!(row.expandable && !row.expanded, "replica groups start collapsed");
+        assert!(!rows.iter().find(|r| r.label == "db").unwrap().expandable, "one container: a plain row");
+        assert!(!keys(&rows).contains(&"demo-web-1".to_string()));
+        sb.toggle(&web);
+        let rows = sb.rows(&s);
+        let labels = keys(&rows);
+        let i = labels.iter().position(|l| l == "web").unwrap();
+        assert_eq!(labels[i + 1..i + 4], ["demo-web-1", "demo-web-2", "demo-web-3"]);
+        assert!(rows[i + 1..i + 4].iter().all(|r| r.depth == 3 && matches!(r.key, NodeKey::Container(_))));
+        assert!(rows[i + 3].last_child);
+        // `e` hides exited replicas too; the group stays a group.
+        sb.show_exited = false;
+        let labels = keys(&sb.rows(&s));
+        assert!(labels.contains(&"demo-web-2".to_string()) && !labels.contains(&"demo-web-3".to_string()));
+        // Filtering opens groups and matches replica names.
+        let mut sb = Sidebar::default();
+        sb.filter = "web-2".into();
+        assert!(keys(&sb.rows(&s)).contains(&"demo-web-2".to_string()));
+    }
+
+    #[test]
+    fn replica_rows_draw_tree_guides_and_the_group_sums_cpu() {
+        let s = replicated();
+        let mut sb = Sidebar::default();
+        sb.toggle(&NodeKey::Service("demo".into(), "web".into()));
+        let rows = sb.rows(&s);
+        let cpu = HashMap::from([(s.containers[0].id.clone(), 1.5), (s.containers[1].id.clone(), 2.0)]);
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        let ctx = RenderCtx { snap: &s, cpu: &cpu, theme: &theme, focused: false, title: "t", filter_editing: false };
+        sb.render(&mut buf, area, &rows, &ctx);
+        let text = |y: u16| (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>();
+        let all: Vec<String> = (1..10).map(text).collect();
+        let web = all.iter().find(|l| l.contains(" web ")).unwrap();
+        assert!(web.contains("▾ web 2/3") && web.trim_end().ends_with("3.50%"), "{all:#?}");
+        // web is the project's last service, so no stem continues past it.
+        assert!(
+            all.iter().any(|l| l.starts_with("     ├ ▶ demo-web-1") && l.trim_end().ends_with("1.50%")),
+            "{all:#?}"
+        );
+        assert!(all.iter().any(|l| l.starts_with("     └ ⨯ demo-web-3")), "{all:#?}");
+    }
+
+    #[test]
+    fn ancestors_of_a_replica_are_its_section_project_and_service() {
+        let s = replicated();
+        let web = |n: usize| NodeKey::Container(s.containers[n].id.clone());
+        let groups = ancestors(&web(1), &s);
+        assert_eq!(groups.last(), Some(&NodeKey::Service("demo".into(), "web".into())));
+        assert_eq!(groups[0], NodeKey::Section(Section::Projects));
+        let db = NodeKey::Container(s.containers[3].id.clone());
+        assert_eq!(ancestors(&db, &s), vec![NodeKey::Section(Section::Containers)], "not a listed replica");
+    }
+
+    #[test]
+    fn a_vanished_replica_leaves_the_selection_in_projects() {
+        let mut s = replicated();
+        let mut sb = Sidebar::default();
+        sb.toggle(&NodeKey::Service("demo".into(), "web".into()));
+        let rows = sb.rows(&s);
+        let gone = NodeKey::Container(s.containers[2].id.clone());
+        sb.select(&rows, &gone);
+        s.containers.remove(2);
+        s.projects = derive_projects(&s.containers, None);
+        let rows = sb.rows(&s);
+        sb.reconcile(&rows);
+        let i = sb.selected_index;
+        assert_eq!(section_at(&rows, i), Some(Section::Projects), "{:?}", rows[i].key);
     }
 
     #[test]

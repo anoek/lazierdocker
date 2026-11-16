@@ -2,7 +2,7 @@
 //!
 //! Project/service derivation follows lazydocker (docs/reference/lazydocker-inventory.md §1).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use bollard::models::{
     ContainerSummary, ContainerSummaryStateEnum, ImageSummary, Network as BNetwork, PortSummary, Volume as BVolume,
@@ -11,6 +11,8 @@ use bollard::models::{
 pub const LABEL_PROJECT: &str = "com.docker.compose.project";
 pub const LABEL_SERVICE: &str = "com.docker.compose.service";
 pub const LABEL_ONEOFF: &str = "com.docker.compose.oneoff";
+/// A service replica's number (1, 2, …); a recreated container keeps it.
+pub const LABEL_NUMBER: &str = "com.docker.compose.container-number";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContainerState {
@@ -78,6 +80,8 @@ pub struct Container {
     pub labels: BTreeMap<String, String>,
     pub project: Option<String>,
     pub service: Option<String>,
+    /// Compose replica number.
+    pub number: Option<u32>,
     pub oneoff: bool,
 }
 
@@ -91,7 +95,16 @@ impl Container {
 pub struct Service {
     pub name: String,
     pub project: String,
-    pub container_id: Option<String>,
+    /// One container per replica, by replica number. A replica whose container
+    /// is being recreated is still one replica (its running, else first, container).
+    pub replicas: Vec<String>,
+}
+
+impl Service {
+    /// Scaled to more than one container.
+    pub fn is_replicated(&self) -> bool {
+        self.replicas.len() > 1
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +172,18 @@ impl Snapshot {
 
     pub fn service(&self, project: &str, name: &str) -> Option<&Service> {
         self.project(project)?.services.iter().find(|s| s.name == name)
+    }
+
+    /// The container a single-container view of a service shows: its first
+    /// running replica, else its first.
+    pub fn primary(&self, service: &Service) -> Option<&Container> {
+        let replicas: Vec<&Container> = service.replicas.iter().filter_map(|id| self.container(id)).collect();
+        replicas.iter().find(|c| c.is_running()).or(replicas.first()).copied()
+    }
+
+    /// A service's replica containers, by replica number.
+    pub fn replicas<'a>(&'a self, service: &'a Service) -> impl Iterator<Item = &'a Container> + 'a {
+        service.replicas.iter().filter_map(|id| self.container(id))
     }
 
     pub fn image(&self, id: &str) -> Option<&Image> {
@@ -247,6 +272,7 @@ impl Container {
             ports,
             project: labels.get(LABEL_PROJECT).cloned(),
             service: labels.get(LABEL_SERVICE).cloned(),
+            number: labels.get(LABEL_NUMBER).and_then(|n| n.parse().ok()),
             oneoff: labels.get(LABEL_ONEOFF).is_some_and(|v| v.eq_ignore_ascii_case("true")),
             labels,
         }
@@ -312,30 +338,35 @@ pub fn derive_projects(containers: &[Container], local: Option<&LocalCompose>) -
         let set = services.entry(l.project.clone()).or_default();
         set.extend(l.services.iter().cloned());
     }
-    // First non-oneoff container per (project, service); prefer a running one.
-    let mut by_key: HashMap<(&str, &str), &Container> = HashMap::new();
+    // One container per replica (project, service, number); prefer a running
+    // one, as a recreate briefly leaves an old and a new container per number.
+    // Containers without a number are replicas of their own.
+    let mut slots: BTreeMap<(&str, &str, Option<u32>, &str), &Container> = BTreeMap::new();
     for c in containers.iter().filter(|c| !c.oneoff) {
         if let (Some(p), Some(s)) = (&c.project, &c.service) {
-            let e = by_key.entry((p.as_str(), s.as_str())).or_insert(c);
+            let own = if c.number.is_some() { "" } else { c.name.as_str() };
+            let e = slots.entry((p.as_str(), s.as_str(), c.number, own)).or_insert(c);
             if !e.is_running() && c.is_running() {
                 *e = c;
             }
         }
     }
+    let replicas = |p: &str, s: &str| -> Vec<&Container> {
+        slots.iter().filter(|((sp, ss, _, _), _)| *sp == p && *ss == s).map(|(_, c)| *c).collect()
+    };
     let mut out: Vec<Project> = services
         .into_iter()
         .map(|(name, svcs)| {
             let mut services: Vec<Service> = svcs
                 .into_iter()
                 .map(|s| Service {
-                    container_id: by_key.get(&(name.as_str(), s.as_str())).map(|c| c.id.clone()),
+                    replicas: replicas(&name, &s).iter().map(|c| c.id.clone()).collect(),
                     name: s,
                     project: name.clone(),
                 })
                 .collect();
-            services.sort_by(|a, b| {
-                a.container_id.is_none().cmp(&b.container_id.is_none()).then_with(|| a.name.cmp(&b.name))
-            });
+            services
+                .sort_by(|a, b| a.replicas.is_empty().cmp(&b.replicas.is_empty()).then_with(|| a.name.cmp(&b.name)));
             Project { local: local.is_some_and(|l| l.project == name), name, services }
         })
         .collect();
@@ -364,6 +395,7 @@ pub(crate) mod tests {
             ports: vec![],
             project: project.map(|p| p.0.into()),
             service: project.map(|p| p.1.into()),
+            number: project.map(|_| 1),
             oneoff: false,
             labels,
         }
@@ -381,10 +413,43 @@ pub(crate) mod tests {
         let ps = derive_projects(&cs, Some(&local));
         let names: Vec<_> = ps.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["other", "demo"], "local project first");
-        let other: Vec<_> = ps[0].services.iter().map(|s| (s.name.as_str(), s.container_id.is_some())).collect();
+        let other: Vec<_> = ps[0].services.iter().map(|s| (s.name.as_str(), !s.replicas.is_empty())).collect();
         assert_eq!(other, vec![("api", true), ("cache", false)]);
         assert_eq!(ps[1].services.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["db", "web"]);
-        assert_eq!(ps[1].services[1].container_id.as_deref(), Some("demo-web-1-id-0123456789abcdef"));
+        assert_eq!(ps[1].services[1].replicas, ["demo-web-1-id-0123456789abcdef"]);
+    }
+
+    /// A container of `service` with compose replica `number`.
+    pub fn replica(project: &str, service: &str, number: u32, state: ContainerState) -> Container {
+        let mut c = container(&format!("{project}-{service}-{number}"), state, Some((project, service)));
+        c.number = Some(number);
+        c
+    }
+
+    #[test]
+    fn replicas_by_number_and_recreate_is_one_replica() {
+        let mut old = replica("demo", "web", 2, ContainerState::Exited);
+        old.id = "old-web-2".into();
+        let cs = vec![
+            replica("demo", "web", 3, ContainerState::Exited),
+            replica("demo", "web", 1, ContainerState::Exited),
+            old,
+            replica("demo", "web", 2, ContainerState::Running),
+            replica("demo", "db", 1, ContainerState::Running),
+        ];
+        let ps = derive_projects(&cs, None);
+        let web = ps[0].services.iter().find(|s| s.name == "web").unwrap();
+        let ids: Vec<&str> = web.replicas.iter().map(|id| id.split("-id-").next().unwrap()).collect();
+        assert_eq!(ids, vec!["demo-web-1", "demo-web-2", "demo-web-3"], "by number; the recreated one counts once");
+        assert!(web.is_replicated());
+        let snap = Snapshot { containers: cs.clone(), projects: ps.clone(), ..Default::default() };
+        assert_eq!(
+            snap.primary(web).map(|c| c.id.as_str()),
+            Some(web.replicas[1].as_str()),
+            "the first running replica"
+        );
+        let db = ps[0].services.iter().find(|s| s.name == "db").unwrap();
+        assert!(!db.is_replicated());
     }
 
     #[test]
@@ -446,7 +511,7 @@ pub(crate) mod tests {
             image: Some("nginx:alpine".into()),
             state: Some(ContainerSummaryStateEnum::EXITED),
             status: Some("Exited (2) 1 minute ago".into()),
-            labels: Some(HashMap::from([
+            labels: Some(std::collections::HashMap::from([
                 (LABEL_PROJECT.to_string(), "demo".to_string()),
                 (LABEL_SERVICE.to_string(), "web".to_string()),
                 (LABEL_ONEOFF.to_string(), "False".to_string()),

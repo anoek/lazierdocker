@@ -26,6 +26,11 @@ pub fn demo_snapshot() -> Snapshot {
     Snapshot { projects: derive_projects(&containers, None), containers, ..Default::default() }
 }
 
+/// Install a terminal in a pane, as the runtime does for StartLogs.
+fn install_term(app: &mut App, pane: PaneId) {
+    app.panes.get_mut(&pane).unwrap().content = Content::Term(TermSurface::stream(80, 24, Arc::new(|| {})).unwrap());
+}
+
 pub fn loaded_app() -> App {
     let mut app = App::new("tcp://test");
     app.handle_app_event(AppEvent::Snapshot(Box::new(demo_snapshot())));
@@ -270,7 +275,7 @@ mod inspector {
         draw(&mut app, 120, 30);
         let pane = app.layout.focus;
         // A service from the compose file that has no container yet.
-        let svc = crate::docker::model::Service { name: "cache".into(), project: "demo".into(), container_id: None };
+        let svc = crate::docker::model::Service { name: "cache".into(), project: "demo".into(), replicas: vec![] };
         app.snap.projects[0].services.push(svc);
         app.rebuild_rows();
         app.select_key(&NodeKey::Service("demo".into(), "cache".into()));
@@ -312,7 +317,7 @@ mod inspector {
         app.set_tab(pane, Tab::Config);
         let effects = app.sync_panes();
         let Some(Effect::Load { key, spec, .. }) = effects.first().cloned() else { panic!("{effects:?}") };
-        assert_eq!(spec, LoadSpec::ContainerConfig { id: id.clone() });
+        assert_eq!(spec, LoadSpec::ContainerConfig { id: id.clone(), note: None });
         // Nothing new to load on a second sync.
         assert!(app.sync_panes().is_empty());
         // A stale result (different key) is ignored; the matching one is shown.
@@ -333,7 +338,7 @@ mod inspector {
         app.set_tab(pane, Tab::Env);
         let effects = app.sync_panes();
         assert!(
-            matches!(&effects[0], Effect::Load { spec: LoadSpec::ContainerEnv { id }, .. } if id.starts_with("demo-web-1"))
+            matches!(&effects[0], Effect::Load { spec: LoadSpec::ContainerEnv { id, note: None }, .. } if id.starts_with("demo-web-1"))
         );
     }
 
@@ -381,7 +386,9 @@ mod inspector {
 mod streams {
     use super::*;
     use crate::app::inspect::LoadSpec;
+    use crate::app::logs::{LogSource, StreamEnd};
     use crate::doc::format::stats as stats_lines;
+    use crate::docker::logs::LogTime;
     use crate::docker::stats::{StatsHistory, StatsSample};
 
     #[test]
@@ -392,42 +399,74 @@ mod streams {
         let pane = app.layout.focus;
         app.set_tab(pane, Tab::Logs);
         let effects = app.sync_panes();
-        assert!(matches!(&effects[..], [Effect::StartLogs { container_id, .. }] if *container_id == id), "{effects:?}");
+        let only_loner = [LogSource { id, prefix: None }];
+        assert!(matches!(&effects[..], [Effect::StartLogs { sources, .. }] if *sources == only_loner), "{effects:?}");
         assert!(app.sync_panes().is_empty(), "no restart while nothing changed");
     }
 
-    #[test]
-    fn logs_restart_when_container_restarts() {
-        let mut app = loaded_app();
-        let id = container_id(&app, "loner");
-        app.select_key(&NodeKey::Container(id.clone()));
-        app.set_tab(app.layout.focus, Tab::Logs);
-        app.sync_panes();
-        let mut snap = demo_snapshot();
-        snap.containers.iter_mut().find(|c| c.id == id).unwrap().state = ContainerState::Exited;
-        app.handle_app_event(AppEvent::Snapshot(Box::new(snap)));
-        assert!(matches!(&app.sync_panes()[..], [Effect::StartLogs { .. }]));
-    }
-
-    /// Start a logs stream for `loner`; returns (pane, key).
-    fn start_loner_logs(app: &mut App) -> (PaneId, inspect::ContentKey) {
+    /// Start a logs stream for `loner` (terminal installed); returns its pane.
+    fn start_loner_logs(app: &mut App) -> PaneId {
         select_loner(app);
         app.set_tab(app.layout.focus, Tab::Logs);
         let fx = app.sync_panes();
-        let [Effect::StartLogs { pane, key, .. }] = &fx[..] else { panic!("{fx:?}") };
-        (*pane, key.clone())
+        let [Effect::StartLogs { pane, .. }] = &fx[..] else { panic!("{fx:?}") };
+        install_term(app, *pane);
+        *pane
+    }
+
+    /// The end report of `container`'s current stream run in a Logs pane.
+    fn ended(app: &App, pane: PaneId, container: &str, clean: bool, last: &str) -> AppEvent {
+        let run = app.panes[&pane].logs[container].run;
+        let end = StreamEnd { container: container.to_string(), clean, last: LogTime::parse(last) };
+        AppEvent::LogsEnded { pane, run, end }
+    }
+
+    fn with_state(app: &App, name: &str, state: ContainerState) -> Snapshot {
+        let mut snap = app.snap.clone();
+        snap.containers.iter_mut().find(|c| c.name == name).unwrap().state = state;
+        snap
+    }
+
+    #[test]
+    fn a_restart_appends_to_the_logs_instead_of_reloading_them() {
+        let mut app = loaded_app();
+        let id = container_id(&app, "loner");
+        let pane = start_loner_logs(&mut app);
+        app.handle_app_event(AppEvent::Snapshot(Box::new(with_state(&app, "loner", ContainerState::Exited))));
+        assert!(app.sync_panes().is_empty(), "stopping doesn't reload the pane");
+        app.handle_app_event(ended(&app, pane, &id, true, "2026-11-16T10:00:00.5Z"));
+        app.handle_app_event(AppEvent::Snapshot(Box::new(with_state(&app, "loner", ContainerState::Running))));
+        let fx = app.sync_panes();
+        let [Effect::FollowLogs { source, after, .. }] = &fx[..] else { panic!("{fx:?}") };
+        assert_eq!(source.id, id);
+        assert_eq!(*after, LogTime::parse("2026-11-16T10:00:00.5Z"), "continues after the last line shown");
+        assert!(matches!(app.panes[&pane].content, Content::Term(_)), "same terminal, output kept");
+    }
+
+    #[test]
+    fn output_after_a_resume_starts_below_the_ended_notice() {
+        let mut app = loaded_app();
+        let id = container_id(&app, "loner");
+        let pane = start_loner_logs(&mut app);
+        app.handle_app_event(ended(&app, pane, &id, true, ""));
+        let Content::Term(t) = &app.panes[&pane].content else { panic!() };
+        t.feeder(false).feed(b"next run\r\n");
+        let text = t.viewport_text();
+        assert!(text.iter().any(|l| l == "[log stream ended]"), "{text:?}");
+        assert!(text.iter().any(|l| l == "next run"), "{text:?}");
     }
 
     #[test]
     fn logs_resume_after_restart_missed_by_snapshots() {
-        // `docker restart` is fast: snapshots may only ever see "running",
-        // so the content key never changes. The ended stream must resume.
+        // `docker restart` is fast: snapshots may only ever see "running".
+        // The ended stream must resume anyway.
         let mut app = loaded_app();
-        let (pane, key) = start_loner_logs(&mut app);
-        app.handle_app_event(AppEvent::LogsEnded { pane, key, clean: true });
+        let id = container_id(&app, "loner");
+        let pane = start_loner_logs(&mut app);
+        app.handle_app_event(ended(&app, pane, &id, true, ""));
         assert!(app.sync_panes().is_empty(), "wait for a snapshot taken after the stream ended");
         app.handle_app_event(AppEvent::Snapshot(Box::new(demo_snapshot())));
-        assert!(matches!(&app.sync_panes()[..], [Effect::StartLogs { .. }]));
+        assert!(matches!(&app.sync_panes()[..], [Effect::FollowLogs { .. }]));
         assert!(app.sync_panes().is_empty(), "resume once");
     }
 
@@ -435,22 +474,38 @@ mod streams {
     fn logs_stay_ended_while_container_stopped() {
         let mut app = loaded_app();
         let id = container_id(&app, "loner");
-        start_loner_logs(&mut app);
-        let mut snap = demo_snapshot();
-        snap.containers.iter_mut().find(|c| c.id == id).unwrap().state = ContainerState::Exited;
-        app.handle_app_event(AppEvent::Snapshot(Box::new(snap.clone())));
-        let fx = app.sync_panes();
-        let [Effect::StartLogs { pane, key, .. }] = &fx[..] else { panic!("{fx:?}") };
-        app.handle_app_event(AppEvent::LogsEnded { pane: *pane, key: key.clone(), clean: true });
-        app.handle_app_event(AppEvent::Snapshot(Box::new(snap)));
+        let pane = start_loner_logs(&mut app);
+        let stopped = with_state(&app, "loner", ContainerState::Exited);
+        app.handle_app_event(AppEvent::Snapshot(Box::new(stopped.clone())));
+        app.handle_app_event(ended(&app, pane, &id, true, ""));
+        app.handle_app_event(AppEvent::Snapshot(Box::new(stopped)));
         assert!(app.sync_panes().is_empty());
+    }
+
+    #[test]
+    fn an_end_reported_by_a_replaced_stream_is_ignored() {
+        // `f` reloads the same view (same key). The old stream's task is
+        // aborted, but it may already have reported its end.
+        let mut app = loaded_app();
+        let id = container_id(&app, "loner");
+        let pane = start_loner_logs(&mut app);
+        let stale = ended(&app, pane, &id, true, "2026-11-16T10:00:00Z");
+        app.focus = Focus::Panes;
+        app.handle_key(crate::app::tests::key(KeyCode::Char('f')));
+        assert!(matches!(&app.sync_panes()[..], [Effect::StartLogs { .. }]));
+        install_term(&mut app, pane);
+        app.handle_app_event(stale);
+        app.handle_app_event(AppEvent::Snapshot(Box::new(demo_snapshot())));
+        let fx = app.sync_panes();
+        assert!(fx.is_empty(), "the new stream is still running; a second one would repeat its lines: {fx:?}");
     }
 
     #[test]
     fn logs_do_not_resume_after_stream_error() {
         let mut app = loaded_app();
-        let (pane, key) = start_loner_logs(&mut app);
-        app.handle_app_event(AppEvent::LogsEnded { pane, key, clean: false });
+        let id = container_id(&app, "loner");
+        let pane = start_loner_logs(&mut app);
+        app.handle_app_event(ended(&app, pane, &id, false, ""));
         app.handle_app_event(AppEvent::Snapshot(Box::new(demo_snapshot())));
         assert!(app.sync_panes().is_empty());
     }
@@ -465,18 +520,19 @@ mod streams {
     #[test]
     fn f_reloads_logs_with_full_history_until_view_changes() {
         let mut app = loaded_app();
-        let (pane, _) = start_loner_logs(&mut app);
+        let pane = start_loner_logs(&mut app);
         assert!(app.pane_menu(pane).items.iter().any(|i| i.action == Action::FullLogs(pane)));
         app.focus = Focus::Panes;
         app.handle_key(key(KeyCode::Char('f')));
         assert_eq!(starts_full(&app.sync_panes()), Some(true));
         assert!(app.sync_panes().is_empty(), "reload once");
         assert!(!app.pane_menu(pane).items.iter().any(|i| i.action == Action::FullLogs(pane)));
-        // Full history survives a restart resume...
-        let key = app.panes[&pane].loaded.clone().unwrap();
-        app.handle_app_event(AppEvent::LogsEnded { pane, key, clean: true });
+        // A restart resumes the same full view...
+        install_term(&mut app, pane);
+        app.handle_app_event(ended(&app, pane, &container_id(&app, "loner"), true, ""));
         app.handle_app_event(AppEvent::Snapshot(Box::new(demo_snapshot())));
-        assert_eq!(starts_full(&app.sync_panes()), Some(true));
+        assert!(matches!(&app.sync_panes()[..], [Effect::FollowLogs { .. }]));
+        assert!(app.panes[&pane].full_logs);
         // ...but not switching to another tab and back.
         app.cycle_tab(pane, 1);
         app.sync_panes();
@@ -487,7 +543,7 @@ mod streams {
     #[test]
     fn full_history_only_for_logs_tab() {
         let mut app = loaded_app();
-        let (pane, _) = start_loner_logs(&mut app);
+        let pane = start_loner_logs(&mut app);
         app.set_tab(pane, Tab::Env);
         app.sync_panes();
         assert!(!app.pane_menu(pane).items.iter().any(|i| i.action == Action::FullLogs(pane)));
@@ -527,8 +583,10 @@ mod streams {
         app.select_key(&NodeKey::Container(id.clone()));
         app.set_tab(app.layout.focus, Tab::Top);
         let fx = app.sync_panes();
-        let [Effect::Load { spec: LoadSpec::Top { id: i }, key, pane }] = &fx[..] else { panic!("{fx:?}") };
-        assert_eq!(*i, id);
+        let [Effect::Load { spec: LoadSpec::Top { containers, labelled: false }, key, pane }] = &fx[..] else {
+            panic!("{fx:?}")
+        };
+        assert_eq!(*containers, [("loner".to_string(), id)]);
         // Top refreshes every tick once the previous result arrived.
         app.handle_app_event(AppEvent::Doc { pane: *pane, key: key.clone(), lines: vec![] });
         app.tick += 1;
@@ -1637,5 +1695,176 @@ mod find {
         app.handle_event(crossterm::event::Event::Paste("ERROR b\nignored".into()));
         assert_eq!(app.find.as_ref().unwrap().query, "ERROR b");
         assert_eq!(app.find.as_ref().unwrap().matches.len(), 1);
+    }
+}
+
+mod replicas {
+    use super::*;
+    use crate::app::inspect::LoadSpec;
+    use crate::docker::model::tests::replica;
+    use crate::docker::model::Snapshot;
+    use crate::docker::stats::{StatsHistory, StatsSample};
+
+    /// demo: web scaled to `n` (all running), plus db.
+    fn snapshot(n: u32) -> Snapshot {
+        let mut containers: Vec<_> = (1..=n).map(|i| replica("demo", "web", i, ContainerState::Running)).collect();
+        containers.push(replica("demo", "db", 1, ContainerState::Running));
+        Snapshot { projects: derive_projects(&containers, None), containers, ..Default::default() }
+    }
+
+    fn web() -> NodeKey {
+        NodeKey::Service("demo".into(), "web".into())
+    }
+
+    fn app_on_web(n: u32, tab: Tab) -> (App, PaneId) {
+        let mut app = App::new("tcp://test");
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snapshot(n))));
+        draw(&mut app, 120, 30);
+        app.select_key(&web());
+        let pane = app.layout.focus;
+        app.set_tab(pane, tab);
+        (app, pane)
+    }
+
+    #[test]
+    fn service_logs_combine_every_replica_with_labels() {
+        let (mut app, pane) = app_on_web(3, Tab::Logs);
+        let fx = app.sync_panes();
+        let [Effect::StartLogs { sources, .. }] = &fx[..] else { panic!("{fx:?}") };
+        assert_eq!(sources.len(), 3);
+        let prefixes: Vec<&str> = sources.iter().map(|s| s.prefix.as_deref().unwrap()).collect();
+        assert!(prefixes[0].contains("web-1 │") && prefixes[2].contains("web-3 │"), "{prefixes:?}");
+        assert_ne!(prefixes[0][..12], prefixes[1][..12], "each replica has its own colour");
+        // A scale-up joins the same view; nothing reloads.
+        install_term(&mut app, pane);
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snapshot(4))));
+        let fx = app.sync_panes();
+        let [Effect::FollowLogs { source, after: None, .. }] = &fx[..] else { panic!("{fx:?}") };
+        assert!(source.prefix.as_deref().unwrap().contains("web-4"));
+        assert!(app.sync_panes().is_empty());
+    }
+
+    #[test]
+    fn one_replica_restarting_resumes_alone_and_the_notice_waits_for_the_last() {
+        use crate::app::logs::StreamEnd;
+        let (mut app, pane) = app_on_web(2, Tab::Logs);
+        app.sync_panes();
+        install_term(&mut app, pane);
+        let ids = app.snap.service("demo", "web").unwrap().replicas.clone();
+        let end = |app: &App, id: &String| {
+            let run = app.panes[&pane].logs[id].run;
+            AppEvent::LogsEnded { pane, run, end: StreamEnd { container: id.clone(), clean: true, last: None } }
+        };
+        let notices = |app: &App| match &app.panes[&pane].content {
+            Content::Term(t) => t.viewport_text().iter().filter(|l| l.contains("log stream ended")).count(),
+            _ => panic!(),
+        };
+        app.handle_app_event(end(&app, &ids[0]));
+        assert_eq!(notices(&app), 0, "web-2 still streams");
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snapshot(2))));
+        let fx = app.sync_panes();
+        assert!(
+            matches!(&fx[..], [Effect::FollowLogs { source, .. }] if source.id == ids[0]),
+            "only web-1 resumes: {fx:?}"
+        );
+        app.handle_app_event(end(&app, &ids[0]));
+        app.handle_app_event(end(&app, &ids[1]));
+        assert_eq!(notices(&app), 1, "both stopped");
+    }
+
+    #[test]
+    fn going_from_one_replica_to_two_reloads_with_labels() {
+        let (mut app, _) = app_on_web(1, Tab::Logs);
+        let fx = app.sync_panes();
+        assert!(matches!(&fx[..], [Effect::StartLogs { sources, .. }] if sources[0].prefix.is_none()), "{fx:?}");
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snapshot(2))));
+        let fx = app.sync_panes();
+        assert!(matches!(&fx[..], [Effect::StartLogs { sources, .. }] if sources.iter().all(|s| s.prefix.is_some())));
+    }
+
+    #[test]
+    fn env_and_config_show_the_first_replica_and_say_so() {
+        let (mut app, _) = app_on_web(3, Tab::Env);
+        let fx = app.sync_panes();
+        let [Effect::Load { spec: LoadSpec::ContainerEnv { id, note }, .. }] = &fx[..] else { panic!("{fx:?}") };
+        assert!(id.starts_with("demo-web-1"));
+        assert_eq!(note.as_deref(), Some("showing web-1 of 3 replicas"));
+    }
+
+    #[test]
+    fn top_lists_every_running_replica() {
+        let (mut app, _) = app_on_web(2, Tab::Top);
+        let fx = app.sync_panes();
+        let [Effect::Load { spec: LoadSpec::Top { containers, labelled: true }, .. }] = &fx[..] else {
+            panic!("{fx:?}")
+        };
+        let labels: Vec<&str> = containers.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["web-1", "web-2"]);
+    }
+
+    #[test]
+    fn stats_sum_the_replicas_and_list_each() {
+        let (mut app, pane) = app_on_web(2, Tab::Stats);
+        let now = Instant::now();
+        for (i, c) in app.snap.containers.clone().iter().filter(|c| c.service.as_deref() == Some("web")).enumerate() {
+            let mut h = StatsHistory::default();
+            let sample = |cpu: u64| StatsSample {
+                cpu_total: cpu,
+                system: 1000,
+                online_cpus: 1,
+                mem_usage: 64 * 1024 * 1024,
+                mem_limit: 1024 * 1024 * 1024,
+                pids: 3,
+                ..Default::default()
+            };
+            h.push(now - Duration::from_secs(1), sample(0));
+            let mut s = sample(100 * (i as u64 + 1));
+            s.precpu_total = 0;
+            s.presystem = 0;
+            h.push(now, s);
+            app.stats.insert(c.id.clone(), h);
+        }
+        app.sync_panes();
+        let text: Vec<String> = (0..30).map(|r| app.content_row_text(pane, r)).collect();
+        let find = |s: &str| text.iter().find(|l| l.contains(s)).cloned().unwrap_or_default();
+        assert!(find("CPU (%)").contains("30.00 across 2 replicas"), "10% + 20%: {text:#?}");
+        assert!(find("Memory (MiB)").contains("128.0"), "{text:#?}");
+        assert!(find("PIDs:").ends_with('6'), "{text:#?}");
+        assert!(find("web-2").contains("20.00%") && find("web-2").contains("6.2%"), "{text:#?}");
+    }
+
+    #[test]
+    fn service_actions_reach_every_replica() {
+        use crate::docker::ops::DockerOp;
+        let (mut app, _) = app_on_web(3, Tab::Logs);
+        app.focus = Focus::Sidebar;
+        // No compose files on this machine: the containers are acted on directly.
+        let fx = app.handle_key(key(KeyCode::Char('r')));
+        let [Effect::Docker(DockerOp::All(ops))] = &fx[..] else { panic!("{fx:?}") };
+        assert_eq!(ops.len(), 3);
+        assert!(ops.iter().all(|op| matches!(op, DockerOp::Restart(_))));
+        let fx = app.handle_key(key(KeyCode::Char('p')));
+        assert!(
+            matches!(&fx[..], [Effect::Docker(DockerOp::All(ops))] if ops.len() == 3 && matches!(ops[0], DockerOp::Pause(_)))
+        );
+        // One container: the plain op, as before.
+        let (mut app, _) = app_on_web(1, Tab::Logs);
+        app.focus = Focus::Sidebar;
+        assert!(matches!(&app.handle_key(key(KeyCode::Char('r')))[..], [Effect::Docker(DockerOp::Restart(_))]));
+    }
+
+    #[test]
+    fn a_replica_row_is_a_container_row() {
+        let (mut app, _) = app_on_web(2, Tab::Logs);
+        app.sidebar.toggle(&web());
+        app.rebuild_rows();
+        let second = NodeKey::Container(app.snap.service("demo", "web").unwrap().replicas[1].clone());
+        app.select_key(&second);
+        assert_eq!(app.selected(), Some(&second));
+        let fx = app.sync_panes();
+        assert!(
+            matches!(&fx[..], [Effect::StartLogs { sources, .. }] if sources.len() == 1 && sources[0].prefix.is_none())
+        );
+        assert!(screen(&draw(&mut app, 120, 30)).contains("demo-web-2"));
     }
 }

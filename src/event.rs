@@ -3,6 +3,7 @@
 use ratatui::text::Line;
 
 use crate::app::inspect::ContentKey;
+use crate::app::logs::StreamEnd;
 use crate::docker::model::Snapshot;
 use crate::docker::ops::DockerOp;
 use crate::docker::stats::StatsSample;
@@ -20,8 +21,8 @@ pub enum AppEvent {
     TermActivity(PaneId),
     /// A terminal surface's child process exited.
     TermExited { pane: PaneId, surface: u64, code: Option<u32> },
-    /// A container log stream ended; `clean` unless it ended with an error.
-    LogsEnded { pane: PaneId, key: ContentKey, clean: bool },
+    /// Run `run` of one container's log stream in a Logs pane ended.
+    LogsEnded { pane: PaneId, run: u64, end: StreamEnd },
     /// A docker operation finished.
     OpDone { op: DockerOp, result: Result<Option<String>, String> },
     /// One stats sample for a container.

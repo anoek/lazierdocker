@@ -76,7 +76,7 @@ impl Feeder {
 }
 
 /// Convert lone `\n` into `\r\n` so non-TTY output starts each line at column 0.
-fn normalise_lf(bytes: &[u8]) -> Vec<u8> {
+pub fn normalise_lf(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 16);
     let mut prev = 0u8;
     for &b in bytes {
@@ -473,7 +473,8 @@ impl TermSurface {
 
     /// Write a status line into the terminal (e.g. "[process exited]").
     pub fn notice(&mut self, text: &str) {
-        self.core().term.vt_write(format!("\r\n\x1b[0;2m{text}\x1b[0m").as_bytes());
+        // Ends the line too: a log view's resumed output follows it.
+        self.core().term.vt_write(format!("\r\n\x1b[0;2m{text}\x1b[0m\r\n").as_bytes());
     }
 
     /// Mark output as consumed so the next output wakes the app again.

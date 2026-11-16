@@ -1,6 +1,7 @@
 //! Formatters producing styled lines for the inspector tabs (lazydocker §2 layouts).
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -9,7 +10,7 @@ use serde_json::Value;
 use super::graph;
 use crate::docker::model::Snapshot;
 use crate::docker::present::{self, size, size_binary};
-use crate::docker::stats::StatsHistory;
+use crate::docker::stats::{StatsHistory, StatsSample};
 use crate::ui::sidebar::Section;
 use crate::ui::theme::Theme;
 
@@ -419,6 +420,94 @@ pub fn stats(h: Option<&StatsHistory>, running: bool, width: usize, t: &Theme) -
     out
 }
 
+/// Per second, oldest first, over the histories' span: each running
+/// replica's latest sample (if under 2 s old) summed, as (CPU %, memory MiB).
+fn summed_series(histories: &[&StatsHistory]) -> Vec<(f64, f64)> {
+    let newest = histories.iter().filter_map(|h| h.samples.back()).map(|(at, _)| *at).max();
+    let oldest = histories.iter().filter_map(|h| h.samples.front()).map(|(at, _)| *at).min();
+    let (Some(newest), Some(oldest)) = (newest, oldest) else { return Vec::new() };
+    let seconds = newest.duration_since(oldest).as_secs();
+    (0..=seconds)
+        .rev()
+        .filter_map(|back| newest.checked_sub(Duration::from_secs(back)))
+        .map(|at| {
+            histories
+                .iter()
+                .filter_map(|h| {
+                    let i = h.samples.partition_point(|(t, _)| *t <= at);
+                    let (t, s) = h.samples.get(i.checked_sub(1)?)?;
+                    (at.duration_since(*t) <= Duration::from_secs(2)).then_some(s)
+                })
+                .fold((0.0, 0.0), |(cpu, mem), s| (cpu + s.cpu_percent(), mem + s.mem_usage as f64 / MIB))
+        })
+        .collect()
+}
+
+const MIB: f64 = 1024.0 * 1024.0;
+
+/// Stats tab of a replicated service: CPU and memory summed across running
+/// replicas, totals, then one row per replica. Memory is graphed in MiB, not
+/// as a percentage: without a limit Docker reports the host's memory as each
+/// replica's limit, so a summed percentage would mislead.
+pub fn stats_replicas(replicas: &[(String, Option<&StatsHistory>, bool)], width: usize, t: &Theme) -> Lines {
+    let dim = Style::default().fg(t.overlay0);
+    let live: Vec<&StatsHistory> = replicas
+        .iter()
+        .filter(|(_, _, running)| *running)
+        .filter_map(|(_, h, _)| *h)
+        .filter(|h| !h.samples.is_empty())
+        .collect();
+    if live.is_empty() {
+        let running = replicas.iter().any(|(_, _, running)| *running);
+        return vec![Line::styled(if running { "Waiting for stats…" } else { "no replica is running" }, dim)];
+    }
+    let series = summed_series(&live);
+    let (cpu, mem): (Vec<f64>, Vec<f64>) = series.iter().copied().unzip();
+    let span = graph::span_label(Duration::from_secs(series.len().saturating_sub(1) as u64));
+    let n = live.len();
+    let now = series.last().copied().unwrap_or_default();
+    let mut out = vec![graph::caption(format!("CPU (%): {:.2} across {n} replicas ({span})", now.0), t.cyan)];
+    out.extend(graph::bars(&cpu, width, 8, 1.0, t.cyan, dim));
+    out.push(Line::raw(""));
+    out.push(graph::caption(format!("Memory (MiB): {:.1} across {n} replicas ({span})", now.1), t.green));
+    out.extend(graph::bars(&mem, width, 8, 1.0, t.green, dim));
+    out.push(Line::raw(""));
+    let key = Style::default().fg(t.accent).add_modifier(Modifier::BOLD);
+    let kv = |k: &str, v: String| Line::from(vec![Span::styled(format!("{k:<18}"), key), Span::raw(v)]);
+    let latest: Vec<&StatsSample> = live.iter().filter_map(|h| h.latest()).collect();
+    let sum = |f: fn(&StatsSample) -> u64| latest.iter().map(|s| f(s)).sum::<u64>();
+    out.push(kv("PIDs:", sum(|s| s.pids).to_string()));
+    out.push(kv("Memory:", present::size_binary(sum(|s| s.mem_usage) as i64)));
+    out.push(kv("Traffic received:", present::size(sum(|s| s.rx_bytes) as i64)));
+    out.push(kv("Traffic sent:", present::size(sum(|s| s.tx_bytes) as i64)));
+    out.push(Line::raw(""));
+    let w = replicas.iter().map(|(label, _, _)| label.chars().count()).max().unwrap_or(0).max("REPLICA".len());
+    let head = Style::default().fg(t.overlay1).add_modifier(Modifier::BOLD);
+    out.push(Line::styled(format!("{:<w$}  {:>8}  {:<30} {:>5}", "REPLICA", "CPU", "MEMORY", "PIDS"), head));
+    for (label, h, running) in replicas {
+        match h.and_then(|h| h.latest()).filter(|_| *running) {
+            Some(s) => {
+                let mem = format!(
+                    "{} / {} ({:.1}%)",
+                    present::size_binary(s.mem_usage as i64),
+                    present::size_binary(s.mem_limit as i64),
+                    s.mem_percent()
+                );
+                out.push(Line::raw(format!(
+                    "{label:<w$}  {:>8}  {mem:<30} {:>5}",
+                    format!("{:.2}%", s.cpu_percent()),
+                    s.pids
+                )));
+            }
+            None => out.push(Line::from(vec![
+                Span::raw(format!("{label:<w$}  ")),
+                Span::styled(if *running { "waiting for stats" } else { "not running" }, dim),
+            ])),
+        }
+    }
+    out
+}
+
 /// Section summary tables.
 pub fn summary(section: Section, snap: &Snapshot, cpu: &HashMap<String, f64>, t: &Theme) -> Lines {
     let head = |s: String| Line::styled(s, Style::default().fg(t.overlay1).add_modifier(Modifier::BOLD));
@@ -428,13 +517,7 @@ pub fn summary(section: Section, snap: &Snapshot, cpu: &HashMap<String, f64>, t:
         Section::Projects => {
             out.push(head(format!("{:<28} {:>9}  {}", "PROJECT", "RUNNING", "SERVICES")));
             for p in &snap.projects {
-                let running = p
-                    .services
-                    .iter()
-                    .filter(|s| {
-                        s.container_id.as_deref().and_then(|id| snap.container(id)).is_some_and(|c| c.is_running())
-                    })
-                    .count();
+                let running = p.services.iter().filter(|s| snap.primary(s).is_some_and(|c| c.is_running())).count();
                 let names: Vec<&str> = p.services.iter().map(|s| s.name.as_str()).collect();
                 out.push(Line::from(vec![
                     Span::raw(format!("{:<28} ", p.name)),
@@ -578,5 +661,26 @@ mod tests {
         let t = Theme::default();
         let lines = top(&["PID".into(), "CMD".into()], &[vec!["1".into(), "sleep 100".into()]], &t);
         assert_eq!(text(&lines), vec!["PID  CMD", "1    sleep 100"]);
+    }
+
+    #[test]
+    fn summed_series_covers_every_second() {
+        use crate::docker::stats::{StatsHistory, StatsSample};
+        use std::time::{Duration, Instant};
+        let start = Instant::now() - Duration::from_secs(30);
+        let sample = StatsSample { mem_usage: 1024 * 1024, ..Default::default() };
+        let history = |from: u64| {
+            let mut h = StatsHistory::default();
+            for s in from..=30 {
+                h.push(start + Duration::from_secs(s) + Duration::from_millis(300), sample.clone());
+            }
+            h
+        };
+        let (a, b, c) = (history(0), history(0), history(20));
+        let series = summed_series(&[&a, &b, &c]);
+        assert_eq!(series.len(), 31);
+        let mem: Vec<f64> = series.iter().map(|(_, m)| *m).collect();
+        assert!(mem[..20].iter().all(|m| *m == 2.0), "two replicas before the third started: {mem:?}");
+        assert!(mem[20..].iter().all(|m| *m == 3.0), "{mem:?}");
     }
 }

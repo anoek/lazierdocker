@@ -51,6 +51,7 @@ fn container(name: &str, image: &str, state: ContainerState, status: &str, svc: 
         labels,
         project: svc.map(|s| s.0.into()),
         service: svc.map(|s| s.1.into()),
+        number: svc.map(|_| 1),
         oneoff: false,
     }
 }

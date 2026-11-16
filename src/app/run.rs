@@ -14,15 +14,17 @@ use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use super::inspect::{ContentKey, LOG_TAIL_LINES};
+use super::inspect::ContentKey;
+use super::logs::{self, LogSource};
 use super::{App, Content, Effect};
 use crate::doc::DocSurface;
 use crate::docker::client::{detect_local_compose, Docker};
+use crate::docker::logs::LogTime;
 use crate::docker::ops;
 use crate::docker::refresh::{spawn_refresh, Refresher};
 use crate::docker::stats::StatsStreams;
 use crate::event::{AppEvent, EventRx, EventTx};
-use crate::term::{Feeder, TermSurface, Wake};
+use crate::term::{TermSurface, Wake};
 use crate::ui::layout::PaneId;
 
 /// Shortest time between frames (about 60 fps).
@@ -169,7 +171,10 @@ impl Runtime {
                     let _ = tx.send(AppEvent::Doc { pane, key, lines });
                 });
             }
-            Effect::StartLogs { pane, key, container_id, full } => self.start_logs(app, pane, key, container_id, full),
+            Effect::StartLogs { pane, key, run, sources, full } => self.start_logs(app, pane, key, run, sources, full),
+            Effect::FollowLogs { pane, key, run, source, after } => {
+                self.follow_logs(app, pane, key, run, source, after)
+            }
             Effect::SpawnTerm { pane, key, argv } => {
                 let (cols, rows) = app.content_size(pane);
                 let tx = self.tx.clone();
@@ -187,8 +192,24 @@ impl Runtime {
         }
     }
 
-    /// Show a container's logs in a terminal surface fed by a bollard stream.
-    fn start_logs(&mut self, app: &mut App, pane: PaneId, key: ContentKey, container_id: String, full: bool) {
+    /// Tells the app when each container's stream of a run ends.
+    fn logs_ended(&self, pane: PaneId, run: u64) -> logs::Ended {
+        let tx = self.tx.clone();
+        Arc::new(move |end| {
+            let _ = tx.send(AppEvent::LogsEnded { pane, run, end });
+        })
+    }
+
+    /// Show containers' logs in a terminal surface fed by Docker log streams.
+    fn start_logs(
+        &mut self,
+        app: &mut App,
+        pane: PaneId,
+        key: ContentKey,
+        run: u64,
+        sources: Vec<LogSource>,
+        full: bool,
+    ) {
         let (cols, rows) = app.content_size(pane);
         let surface = match TermSurface::stream(cols, rows, self.wake_for(pane)) {
             Ok(s) => s,
@@ -198,19 +219,33 @@ impl Runtime {
                 return;
             }
         };
-        let (raw, lf) = (surface.feeder(false), surface.feeder(true));
+        let out = surface.feeder(false);
         if !Self::install(app, pane, Some(&key), Content::Term(surface)) {
             return;
         }
-        let docker = self.docker.clone();
-        let tx = self.tx.clone();
-        let task = tokio::spawn(async move {
-            let clean = stream_logs(&docker, &container_id, full, &raw, &lf).await;
-            let _ = tx.send(AppEvent::LogsEnded { pane, key, clean });
-        });
+        let ended = self.logs_ended(pane, run);
+        let task = tokio::spawn(logs::stream_logs(self.docker.clone(), sources, full, out, ended));
         if let Some(p) = app.panes.get_mut(&pane) {
-            p.task = Some(task.abort_handle());
+            p.add_task(task.abort_handle());
         }
+    }
+
+    /// Follow one more container into a Logs pane's terminal.
+    fn follow_logs(
+        &mut self,
+        app: &mut App,
+        pane: PaneId,
+        key: ContentKey,
+        run: u64,
+        source: LogSource,
+        after: Option<LogTime>,
+    ) {
+        let ended = self.logs_ended(pane, run);
+        let Some(p) = app.panes.get_mut(&pane).filter(|p| p.loaded.as_ref() == Some(&key)) else { return };
+        let Content::Term(t) = &p.content else { return };
+        let (out, docker) = (t.feeder(false), self.docker.clone());
+        let task = tokio::spawn(async move { logs::follow_into(&docker, &source, None, after, &out, &ended).await });
+        p.add_task(task.abort_handle());
     }
 }
 
@@ -231,35 +266,4 @@ fn open_url(app: &mut App, url: &str) {
         }
         Err(e) => app.show_error(format!("could not open {url}: {e}")),
     }
-}
-
-/// Follow a container's logs (last `LOG_TAIL_LINES` lines, or everything
-/// when `full`; stdout+stderr). Returns false if the stream ended with an error.
-async fn stream_logs(docker: &Docker, id: &str, full: bool, raw: &Feeder, lf: &Feeder) -> bool {
-    use bollard::container::LogOutput;
-    // Without a TTY, output has bare `\n` line ends.
-    let tty =
-        docker.api.inspect_container(id, None).await.ok().and_then(|i| i.config.and_then(|c| c.tty)).unwrap_or(false);
-    let feeder = if tty { raw } else { lf };
-    let opts = bollard::query_parameters::LogsOptions {
-        follow: true,
-        stdout: true,
-        stderr: true,
-        tail: if full { "all".into() } else { LOG_TAIL_LINES.to_string() },
-        ..Default::default()
-    };
-    let mut stream = docker.api.logs(id, Some(opts));
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(LogOutput::StdOut { message } | LogOutput::StdErr { message } | LogOutput::Console { message }) => {
-                feeder.feed(&message)
-            }
-            Ok(LogOutput::StdIn { .. }) => {}
-            Err(e) => {
-                feeder.feed(format!("\r\n\x1b[31m{e}\x1b[0m\r\n").as_bytes());
-                return false;
-            }
-        }
-    }
-    true
 }

@@ -126,7 +126,7 @@ impl App {
             items.push(MenuItem::new(label, Action::ToggleCollapse(key.clone())).key("space"));
         }
         if !matches!(key, NodeKey::Section(_)) {
-            if self.target_container(key).is_some_and(|c| c.is_running()) {
+            if self.primary_container(key).is_some_and(|c| c.is_running()) {
                 items.push(MenuItem::new("Exec shell", Action::Exec(key.clone())).key("E"));
                 items.push(MenuItem::new("Attach", Action::Attach(key.clone())).key("a"));
             }

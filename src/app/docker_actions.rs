@@ -4,7 +4,7 @@
 use super::actions::Action;
 use super::overlay::{Menu, MenuItem};
 use super::App;
-use crate::docker::model::ContainerState;
+use crate::docker::model::{Container, ContainerState};
 use crate::docker::ops::DockerOp;
 use crate::docker::present;
 use crate::ui::sidebar::{NodeKey, Section};
@@ -164,33 +164,36 @@ impl App {
         })
     }
 
-    /// Service keys: compose commands, or plain docker calls on its container
-    /// when the project's compose files aren't available here.
+    /// Service keys act on every replica: through compose, or without the
+    /// project's compose files here, on the containers directly.
     fn service_action(&self, c: char, p: &str, s: &str) -> Option<Action> {
-        let container = self.snap.service(p, s)?.container_id.clone();
-        let has_files = self.compose_base(p).is_ok();
+        let replicas: Vec<&Container> = self.snap.replicas(self.snap.service(p, s)?).collect();
+        let ids = |keep: fn(&Container) -> bool| -> Vec<String> {
+            replicas.iter().filter(|c| keep(c)).map(|c| c.id.clone()).collect()
+        };
+        let all = ids(|_| true);
+        let direct = !all.is_empty() && self.compose_base(p).is_err();
+        let each = |op: fn(String) -> DockerOp| Action::Docker(DockerOp::each(all.clone(), op));
         Some(match c {
             'u' => self.compose_action(p, &["up", "-d", s]),
             's' => {
-                let action = match (&container, has_files) {
-                    (Some(id), false) => Action::Docker(DockerOp::Stop(id.clone())),
-                    _ => self.compose_action(p, &["stop", s]),
-                };
+                let action = if direct { each(DockerOp::Stop) } else { self.compose_action(p, &["stop", s]) };
                 Action::ask("Stop service", format!("Are you sure you want to stop service {s}?"), false, action)
             }
-            'r' => match (&container, has_files) {
-                (Some(id), false) => Action::Docker(DockerOp::Restart(id.clone())),
-                _ => self.compose_action(p, &["restart", s]),
-            },
-            'S' => match (&container, has_files) {
-                (Some(id), false) => Action::Docker(DockerOp::Start(id.clone())),
-                _ => self.compose_action(p, &["start", s]),
-            },
-            'p' => match container.as_deref().and_then(|id| self.snap.container(id)) {
-                Some(c) if c.state == ContainerState::Paused => Action::Docker(DockerOp::Unpause(c.id.clone())),
-                Some(c) => Action::Docker(DockerOp::Pause(c.id.clone())),
-                None => return None,
-            },
+            'r' if direct => each(DockerOp::Restart),
+            'r' => self.compose_action(p, &["restart", s]),
+            'S' if direct => each(DockerOp::Start),
+            'S' => self.compose_action(p, &["start", s]),
+            // Pause what runs; when nothing does, unpause what is paused.
+            'p' => {
+                let running = ids(|c| c.state == ContainerState::Running);
+                let paused = ids(|c| c.state == ContainerState::Paused);
+                match (running.is_empty(), paused.is_empty()) {
+                    (false, _) => Action::Docker(DockerOp::each(running, DockerOp::Pause)),
+                    (true, false) => Action::Docker(DockerOp::each(paused, DockerOp::Unpause)),
+                    (true, true) => return None,
+                }
+            }
             'd' => Action::Menu(Menu::new(
                 format!("Remove service {s}"),
                 vec![
@@ -223,10 +226,12 @@ impl App {
                 self.compose_action(p, &["up", "-d"]),
             ),
             'D' => Action::Menu(self.down_menu(p)),
-            'w' => match container
-                .as_deref()
-                .and_then(|id| self.snap.container(id))
-                .and_then(|c| present::browser_url(&c.ports))
+            // A running replica's port first.
+            'w' => match replicas
+                .iter()
+                .filter(|c| c.is_running())
+                .chain(&replicas)
+                .find_map(|c| present::browser_url(&c.ports))
             {
                 Some(url) => Action::OpenUrl(url),
                 None => Action::Flash(format!("{s} has no published ports")),
@@ -342,7 +347,7 @@ impl App {
                                 "Stop all",
                                 format!("Stop all {} running containers?", running.len()),
                                 true,
-                                Action::Docker(DockerOp::StopAll(running)),
+                                Action::Docker(DockerOp::All(running.into_iter().map(DockerOp::Stop).collect())),
                             ),
                         )
                         .danger(),
@@ -352,7 +357,11 @@ impl App {
                                 "Remove all",
                                 format!("Force-remove all {} containers?", all.len()),
                                 true,
-                                Action::Docker(DockerOp::RemoveAll(all)),
+                                Action::Docker(DockerOp::All(
+                                    all.into_iter()
+                                        .map(|id| DockerOp::RemoveContainer { id, force: true, volumes: false })
+                                        .collect(),
+                                )),
                             ),
                         )
                         .danger(),

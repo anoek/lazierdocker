@@ -12,6 +12,7 @@ pub mod find;
 pub mod input;
 pub mod inspect;
 pub mod loader;
+pub mod logs;
 pub mod overlay;
 pub mod panes;
 pub mod render;
@@ -26,6 +27,7 @@ use ratatui::layout::{Position, Rect};
 
 pub use panes::{Content, Pane, PaneKind};
 
+use crate::docker::logs::LogTime;
 use crate::docker::model::Snapshot;
 use crate::docker::ops::{is_must_stop, DockerOp};
 use crate::docker::stats::StatsHistory;
@@ -112,13 +114,24 @@ pub enum Effect {
         key: inspect::ContentKey,
         spec: inspect::LoadSpec,
     },
-    /// Stream a container's logs into the pane (bollard, follow); `full`
-    /// streams the whole history instead of the last lines.
+    /// Show containers' logs in the pane: their history merged in time
+    /// order (all of it when `full`), then each followed.
     StartLogs {
         pane: PaneId,
         key: inspect::ContentKey,
-        container_id: String,
+        /// Stream run number (see `LogStream::run`).
+        run: u64,
+        sources: Vec<logs::LogSource>,
         full: bool,
+    },
+    /// Follow one more container into a pane's logs, after `after` (its
+    /// whole log when None): a replica that restarted or was added.
+    FollowLogs {
+        pane: PaneId,
+        key: inspect::ContentKey,
+        run: u64,
+        source: logs::LogSource,
+        after: Option<LogTime>,
     },
     /// Run a command in a PTY inside the pane. `key` is set for inspector
     /// content (installed only if still current); None for terminal panes.
@@ -201,6 +214,8 @@ pub struct App {
     pub quit: bool,
     /// Cached flattened sidebar rows, rebuilt when state changes.
     rows: Vec<Row>,
+    /// Log stream runs started so far (see `logs::LogStream::run`).
+    log_runs: u64,
 }
 
 impl App {
@@ -244,6 +259,7 @@ impl App {
             dirty: true,
             quit: false,
             rows: Vec::new(),
+            log_runs: 0,
         };
         app.rebuild_rows();
         app
@@ -400,17 +416,7 @@ impl App {
                     self.dirty = true;
                 }
             }
-            AppEvent::LogsEnded { pane, key, clean } => {
-                if let Some(p) = self.panes.get_mut(&pane).filter(|p| p.loaded.as_ref() == Some(&key)) {
-                    if let Content::Term(t) = &mut p.content {
-                        t.notice("[log stream ended]");
-                    }
-                    if clean {
-                        p.logs_ended_at = Some(self.snap_generation);
-                    }
-                    self.dirty = true;
-                }
-            }
+            AppEvent::LogsEnded { pane, run, end } => self.on_logs_ended(pane, run, end),
             AppEvent::OpDone { op, result } => return self.on_op_done(op, result),
             AppEvent::Stats(id, sample) => {
                 self.cpu.insert(id.clone(), sample.cpu_percent());

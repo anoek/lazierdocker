@@ -37,13 +37,22 @@ pub enum DockerOp {
     PruneImages,
     PruneVolumes,
     PruneNetworks,
-    StopAll(Vec<String>),
-    RemoveAll(Vec<String>),
+    /// Several operations at once (bulk commands, every replica of a service).
+    All(Vec<DockerOp>),
     /// A non-interactive compose/docker CLI command (argv).
     Cli(Vec<String>),
 }
 
 impl DockerOp {
+    /// `op` on each container: the plain op for one, `All` for several.
+    pub fn each(mut ids: Vec<String>, op: impl Fn(String) -> DockerOp) -> DockerOp {
+        if ids.len() == 1 {
+            op(ids.remove(0))
+        } else {
+            DockerOp::All(ids.into_iter().map(op).collect())
+        }
+    }
+
     /// Present-tense label for the status bar.
     pub fn describe(&self) -> String {
         match self {
@@ -59,8 +68,10 @@ impl DockerOp {
             DockerOp::PruneContainers | DockerOp::PruneImages | DockerOp::PruneVolumes | DockerOp::PruneNetworks => {
                 "pruning".into()
             }
-            DockerOp::StopAll(_) => "stopping all containers".into(),
-            DockerOp::RemoveAll(_) => "removing all containers".into(),
+            DockerOp::All(ops) => match ops.first() {
+                Some(op) => format!("{} {} containers", op.describe(), ops.len()),
+                None => "nothing to do".into(),
+            },
             DockerOp::Cli(argv) => argv.join(" "),
         }
     }
@@ -132,13 +143,7 @@ pub async fn run(docker: &Docker, op: DockerOp) -> Result<Option<String>> {
             let n = r.networks_deleted.map_or(0, |v| v.len());
             return Ok(pruned(n, "networks", None));
         }
-        DockerOp::StopAll(ids) => {
-            all_ok(ids.iter().map(|id| api.stop_container(id, None::<StopContainerOptions>))).await?
-        }
-        DockerOp::RemoveAll(ids) => {
-            let opts = || Some(RemoveContainerOptions { force: true, v: false, link: false });
-            all_ok(ids.iter().map(|id| api.remove_container(id, opts()))).await?
-        }
+        DockerOp::All(ops) => all_ok(ops.into_iter().map(|op| Box::pin(run(docker, op)))).await?,
         DockerOp::Cli(argv) => {
             cli_output(&docker.host, &argv).await?;
         }

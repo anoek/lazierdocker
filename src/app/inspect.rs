@@ -4,10 +4,12 @@
 use ratatui::style::Style;
 use ratatui::text::Line;
 
+use super::logs::{combined, LogSource, LogStream};
 use super::{App, Content, Effect, PaneKind};
 use crate::doc::format::{self, Lines};
 use crate::doc::DocSurface;
 use crate::docker::model::{Container, ContainerState};
+use crate::docker::present::replica_label;
 use crate::ui::layout::PaneId;
 use crate::ui::sidebar::{NodeKey, Section};
 
@@ -84,11 +86,14 @@ pub struct ContentKey {
 /// What the runtime must fetch to fill a pane.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadSpec {
+    /// `note`: a line shown first (which replica this is).
     ContainerConfig {
         id: String,
+        note: Option<String>,
     },
     ContainerEnv {
         id: String,
+        note: Option<String>,
     },
     Image {
         id: String,
@@ -103,8 +108,11 @@ pub enum LoadSpec {
     ComposeConfig {
         argv: Vec<String>,
     },
+    /// `docker top` of each (label, container id); `labelled` adds a
+    /// CONTAINER column (a service's replicas).
     Top {
-        id: String,
+        containers: Vec<(String, String)>,
+        labelled: bool,
     },
 }
 
@@ -160,13 +168,23 @@ impl App {
         }
     }
 
-    /// Container backing a target (containers and services).
-    pub fn target_container(&self, key: &NodeKey) -> Option<&Container> {
+    /// Containers behind a target: a container, or every replica of a service.
+    pub fn target_containers(&self, key: &NodeKey) -> Vec<&Container> {
+        match key {
+            NodeKey::Container(id) => self.snap.container(id).into_iter().collect(),
+            NodeKey::Service(p, s) => {
+                self.snap.service(p, s).map(|svc| self.snap.replicas(svc).collect()).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The container a single-container view of a target shows (for a
+    /// service, its first running replica).
+    pub fn primary_container(&self, key: &NodeKey) -> Option<&Container> {
         match key {
             NodeKey::Container(id) => self.snap.container(id),
-            NodeKey::Service(p, s) => {
-                self.snap.service(p, s)?.container_id.as_deref().and_then(|id| self.snap.container(id))
-            }
+            NodeKey::Service(p, s) => self.snap.primary(self.snap.service(p, s)?),
             _ => None,
         }
     }
@@ -184,16 +202,21 @@ impl App {
                 }
             }
             NodeKey::Container(_) | NodeKey::Service(..) => {
-                if let Some(c) = self.target_container(key) {
-                    c.id.hash(&mut h);
-                    c.state.as_str().hash(&mut h);
-                    c.exit_code.hash(&mut h);
+                let containers = self.target_containers(key);
+                if tab == Tab::Logs {
+                    // Streams follow restarts and new replicas themselves; only
+                    // labelling lines or having nothing to show reloads the view.
+                    (combined(&containers), containers.is_empty()).hash(&mut h);
+                } else {
+                    for c in &containers {
+                        (&c.id, c.state.as_str(), c.exit_code).hash(&mut h);
+                    }
                     if tab == Tab::Stats {
-                        self.stats.get(&c.id).and_then(|s| s.samples.back()).map(|(t, _)| *t).hash(&mut h);
+                        for c in &containers {
+                            self.stats.get(&c.id).and_then(|s| s.samples.back()).map(|(t, _)| *t).hash(&mut h);
+                        }
                         self.content_size(pane).0.hash(&mut h);
                     }
-                } else {
-                    0u8.hash(&mut h);
                 }
             }
             NodeKey::Project(p) if tab == Tab::Config => {
@@ -210,24 +233,26 @@ impl App {
     pub fn sync_panes(&mut self) -> Vec<Effect> {
         self.sync_active_pane();
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
-        let effects = ids.into_iter().filter_map(|id| self.sync_pane(id)).collect();
+        let effects = ids.into_iter().flat_map(|id| self.sync_pane(id)).collect();
         self.refresh_find();
         effects
     }
 
-    fn sync_pane(&mut self, id: PaneId) -> Option<Effect> {
-        if matches!(self.panes.get(&id)?.kind, PaneKind::Terminal { .. }) {
-            return None;
+    fn sync_pane(&mut self, id: PaneId) -> Vec<Effect> {
+        if self.panes.get(&id).is_none_or(|p| matches!(p.kind, PaneKind::Terminal { .. })) {
+            return Vec::new();
         }
         let (Some(target), Some(tab)) = (self.pane_target(id), self.pane_tab(id)) else {
             self.clear_pane(id);
-            return None;
+            return Vec::new();
         };
         let key = ContentKey { rev: self.content_rev(id, &target, tab), target, tab };
-        if self.is_current(id, &key) {
-            self.refresh_top(id, key)
+        if !self.is_current(id, &key) {
+            self.reload_pane(id, key).into_iter().collect()
+        } else if tab == Tab::Logs {
+            self.sync_log_streams(id, &key)
         } else {
-            self.reload_pane(id, key)
+            self.refresh_top(id, key).into_iter().collect()
         }
     }
 
@@ -236,6 +261,7 @@ impl App {
         if let Some(p) = self.panes.get_mut(&id) {
             if p.loaded.is_some() || !matches!(p.content, Content::Doc(_)) {
                 p.loaded = None;
+                p.logs.clear();
                 p.set_content(Content::Doc(DocSurface::message("Nothing selected")));
                 self.forget_view(id);
             }
@@ -244,16 +270,7 @@ impl App {
 
     /// The pane shows `key` and needs no restart.
     fn is_current(&self, id: PaneId, key: &ContentKey) -> bool {
-        let Some(p) = self.panes.get(&id) else { return true };
-        if p.reload || p.loaded.as_ref() != Some(key) {
-            return false;
-        }
-        // A restart can be too quick for any snapshot to see the container
-        // stop, leaving `key` unchanged; resume the ended stream instead.
-        let resume_logs = key.tab == Tab::Logs
-            && p.logs_ended_at.is_some_and(|g| g < self.snap_generation)
-            && self.target_container(&key.target).is_some_and(|c| c.state == ContainerState::Running);
-        !resume_logs
+        self.panes.get(&id).is_none_or(|p| !p.reload && p.loaded.as_ref() == Some(key))
     }
 
     /// Top refreshes every second, one request at a time.
@@ -286,7 +303,7 @@ impl App {
         self.dirty = true;
         let pane = self.panes.get_mut(&id)?;
         pane.loaded = Some(key.clone());
-        pane.logs_ended_at = None;
+        pane.logs.clear();
         pane.reload = false;
         let message = |text: &str| Content::Doc(DocSurface::message(text));
         match plan {
@@ -301,9 +318,13 @@ impl App {
                 pane.refreshed_at = tick;
                 return Some(Effect::Load { pane: id, key, spec });
             }
-            Plan::Logs { container_id } => {
+            Plan::Logs { sources } => {
                 pane.set_content(message("Loading…"));
-                return Some(Effect::StartLogs { pane: id, key, container_id, full: pane.full_logs });
+                self.log_runs += 1;
+                let run = self.log_runs;
+                let following = LogStream { run, following: true, ..Default::default() };
+                pane.logs = sources.iter().map(|s| (s.id.clone(), following.clone())).collect();
+                return Some(Effect::StartLogs { pane: id, key, run, sources, full: pane.full_logs });
             }
             Plan::Spawn { argv } => {
                 pane.set_content(message("Starting…"));
@@ -331,19 +352,42 @@ impl App {
         match (target, tab) {
             (NodeKey::Section(s), _) => Plan::Lines(format::summary(*s, &self.snap, &self.cpu, t)),
             (NodeKey::Container(_) | NodeKey::Service(..), _) => {
-                let Some(c) = self.target_container(target) else {
+                let Some(c) = self.primary_container(target) else {
                     return msg(match target {
                         NodeKey::Container(_) => "container no longer exists",
                         _ => "service has no container",
                     });
                 };
                 let id = c.id.clone();
+                // A service's replicas: Logs, Stats and Top combine them; Env and
+                // Config show one and say which.
+                let replicas = self.target_containers(target);
+                let many = combined(&replicas);
+                let note = many.then(|| format!("showing {} of {} replicas", replica_label(c), replicas.len()));
                 match tab {
-                    Tab::Config => Plan::Load(LoadSpec::ContainerConfig { id }),
-                    Tab::Env => Plan::Load(LoadSpec::ContainerEnv { id }),
-                    Tab::Top if c.state == ContainerState::Running => Plan::Load(LoadSpec::Top { id }),
-                    Tab::Top => msg("container is not running"),
-                    Tab::Logs => Plan::Logs { container_id: id },
+                    Tab::Config => Plan::Load(LoadSpec::ContainerConfig { id, note }),
+                    Tab::Env => Plan::Load(LoadSpec::ContainerEnv { id, note }),
+                    Tab::Top => {
+                        let running: Vec<(String, String)> = replicas
+                            .iter()
+                            .filter(|r| r.state == ContainerState::Running)
+                            .map(|r| (replica_label(r), r.id.clone()))
+                            .collect();
+                        match (running.is_empty(), many) {
+                            (true, true) => msg("no replica is running"),
+                            (true, false) => msg("container is not running"),
+                            (false, _) => Plan::Load(LoadSpec::Top { containers: running, labelled: many }),
+                        }
+                    }
+                    Tab::Logs => Plan::Logs { sources: self.log_sources(target) },
+                    Tab::Stats if many => {
+                        let width = self.content_size(pane).0 as usize;
+                        let rows: Vec<_> = replicas
+                            .iter()
+                            .map(|r| (replica_label(r), self.stats.get(&r.id), r.is_running()))
+                            .collect();
+                        Plan::Lines(format::stats_replicas(&rows, width, t))
+                    }
                     Tab::Stats => {
                         let width = self.content_size(pane).0 as usize;
                         Plan::Lines(format::stats(self.stats.get(&id), c.is_running(), width, t))
@@ -373,6 +417,6 @@ impl App {
 enum Plan {
     Lines(Lines),
     Load(LoadSpec),
-    Logs { container_id: String },
+    Logs { sources: Vec<LogSource> },
     Spawn { argv: Vec<String> },
 }

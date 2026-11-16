@@ -6,6 +6,14 @@ use ratatui::text::Span;
 use super::model::{Container, ContainerState, Health, Port};
 use crate::ui::theme::Theme;
 
+/// Short name of a compose replica, `web-2`; the container name otherwise.
+pub fn replica_label(c: &Container) -> String {
+    match (&c.service, c.number) {
+        (Some(s), Some(n)) => format!("{s}-{n}"),
+        _ => c.name.clone(),
+    }
+}
+
 /// lazydocker "icon" status style.
 pub fn state_icon(state: ContainerState) -> &'static str {
     match state {

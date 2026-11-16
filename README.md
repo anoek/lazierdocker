@@ -73,6 +73,7 @@ clipboard. Shells, `docker attach` and logs run in embedded terminals powered by
 | sidebar | `e` | toggle exited containers |
 | sidebar, pane | `[` `]` | previous / next tab |
 | pane | `j k` `PgUp PgDn` `g G` | scroll (`G` re-enables follow) |
+| pane | `h l` `← →` / shift+wheel | scroll long lines sideways (`›` marks cut-off lines) |
 | containers | `s` `r` `S` `p` `d` | stop, restart, start, pause, remove… |
 | containers | `E` `a` `m` `w` `b` | exec, attach, logs pane, browser, bulk… |
 | services | `u` `R` `U` `D` | up, restart menu, up project, down… |
@@ -84,7 +85,10 @@ clipboard. Shells, `docker attach` and logs run in embedded terminals powered by
 
     lazierdocker [-H HOST] [-p PROJECT] [-f COMPOSE_FILE]...
 
-The Docker host comes from `-H`, otherwise `$DOCKER_HOST`, otherwise the local socket. Compose actions use the
+The Docker host is chosen the way the docker CLI chooses it: `-H`, then `$DOCKER_HOST`, then the current docker
+context (`docker context use …`, so Colima, OrbStack and rootless setups work), then `/var/run/docker.sock`. Only
+`unix://` and `tcp://` hosts are supported. Anything else, such as `ssh://` or TLS, is refused rather than silently
+replaced with another daemon. Compose actions use the
 `docker compose` CLI. For projects outside the current directory, lazierdocker finds their compose files
 through the `com.docker.compose.project.config_files` label.
 

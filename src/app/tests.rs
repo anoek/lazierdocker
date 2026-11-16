@@ -1868,3 +1868,71 @@ mod replicas {
         assert!(screen(&draw(&mut app, 120, 30)).contains("demo-web-2"));
     }
 }
+
+mod project_order {
+    use super::*;
+    use crate::docker::model::Snapshot;
+
+    /// Projects alpha, bravo, charlie (and `extra`), one service each.
+    fn snapshot(extra: &[&str]) -> Snapshot {
+        let containers: Vec<_> = ["alpha", "bravo", "charlie"]
+            .iter()
+            .chain(extra)
+            .map(|p| container(&format!("{p}-app-1"), ContainerState::Running, Some((p, "app"))))
+            .collect();
+        Snapshot { projects: derive_projects(&containers, None), containers, ..Default::default() }
+    }
+
+    fn names(app: &App) -> Vec<&str> {
+        app.snap.projects.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    fn row_of(app: &App, project: &str) -> u16 {
+        let key = NodeKey::Project(project.into());
+        app.hits.sidebar.rows.iter().find(|(_, k)| *k == key).unwrap().0.y
+    }
+
+    fn app() -> App {
+        let mut app = App::new("tcp://test");
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snapshot(&[]))));
+        draw(&mut app, 120, 30);
+        app
+    }
+
+    #[test]
+    fn dragging_a_project_reorders_live_and_saves_on_release() {
+        let mut app = app();
+        let (from, to) = (row_of(&app, "charlie"), row_of(&app, "alpha"));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 4, from));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4, to));
+        assert_eq!(names(&app), ["charlie", "alpha", "bravo"], "moves while dragging");
+        draw(&mut app, 120, 30);
+        let fx = app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4, to));
+        assert_eq!(fx, vec![Effect::SaveProjectOrder(vec!["charlie".into(), "alpha".into(), "bravo".into()])]);
+        assert_eq!(app.selected(), Some(&NodeKey::Project("charlie".into())), "the moved project stays selected");
+        // The next snapshot (in the daemon's order) keeps it; a new project goes last.
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snapshot(&["aardvark"]))));
+        assert_eq!(names(&app), ["charlie", "alpha", "bravo", "aardvark"]);
+    }
+
+    #[test]
+    fn dropping_on_a_service_row_uses_its_project_and_a_click_saves_nothing() {
+        let mut app = app();
+        let click = app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 4, row_of(&app, "alpha")));
+        assert!(click.is_empty());
+        assert!(app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4, row_of(&app, "alpha"))).is_empty());
+        let service_of_charlie = row_of(&app, "charlie") + 1;
+        app.last_click = None; // a separate gesture, not a double-click
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 4, row_of(&app, "alpha")));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4, service_of_charlie));
+        assert_eq!(names(&app), ["bravo", "charlie", "alpha"]);
+    }
+
+    #[test]
+    fn a_saved_order_applies_from_the_first_snapshot() {
+        let mut app = App::new("tcp://test");
+        app.project_order = vec!["bravo".into(), "gone".into(), "alpha".into()];
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snapshot(&[]))));
+        assert_eq!(names(&app), ["bravo", "alpha", "charlie"], "unplaced projects follow");
+    }
+}

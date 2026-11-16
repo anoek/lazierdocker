@@ -15,6 +15,7 @@ pub mod loader;
 pub mod logs;
 pub mod overlay;
 pub mod panes;
+pub mod projects;
 pub mod render;
 pub mod run;
 pub mod selection;
@@ -71,6 +72,11 @@ pub enum Drag {
     TermMouse(PaneId),
     /// Selecting text in a pane.
     Select(PaneId),
+    /// Moving a project in the sidebar; `moved` once its place changed.
+    Project {
+        name: String,
+        moved: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -146,6 +152,8 @@ pub enum Effect {
     Copy(String),
     Docker(DockerOp),
     OpenUrl(String),
+    /// Remember the project order between runs.
+    SaveProjectOrder(Vec<String>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -208,6 +216,8 @@ pub struct App {
     pub pending_ops: Vec<String>,
     /// Compose files given on the command line (local project).
     pub compose_files: Vec<String>,
+    /// Project names in the order the user arranged them (see `projects`).
+    pub project_order: Vec<String>,
     pub overlay_hits: overlay::OverlayHits,
     pub size: (u16, u16),
     pub dirty: bool,
@@ -254,6 +264,7 @@ impl App {
             last_find: String::new(),
             pending_ops: Vec::new(),
             compose_files: Vec::new(),
+            project_order: Vec::new(),
             overlay_hits: overlay::OverlayHits::default(),
             size: (80, 24),
             dirty: true,
@@ -442,6 +453,7 @@ impl App {
     fn on_snapshot(&mut self, snap: Snapshot) -> Vec<Effect> {
         let first_load = !self.loaded;
         self.snap = snap;
+        self.apply_project_order();
         self.snap_generation += 1;
         self.loaded = true;
         self.docker_error = None;

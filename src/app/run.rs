@@ -76,6 +76,7 @@ pub async fn run(opts: Options) -> Result<()> {
     let refresher = spawn_refresh(docker.clone(), local, tx.clone());
     let mut app = App::new(docker.host.clone());
     app.compose_files = opts.compose_files;
+    app.project_order = crate::state::load_project_order();
     let mut rt = Runtime { docker, tx, refresher, stats: StatsStreams::default() };
     // Restore the terminal however we leave, including a failed setup.
     let result = match setup_terminal() {
@@ -189,6 +190,12 @@ impl Runtime {
                 Self::install(app, pane, key.as_ref(), content);
             }
             Effect::SyncStats(running) => self.stats.sync(&running, &self.docker, &self.tx),
+            Effect::SaveProjectOrder(order) => {
+                // Best effort: the order still holds for this session.
+                if let Err(e) = crate::state::save_project_order(&order) {
+                    app.flash(format!("could not save the project order: {e}"));
+                }
+            }
         }
     }
 

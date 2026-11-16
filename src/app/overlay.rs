@@ -135,6 +135,7 @@ const HELP: &[(&str, &str, &str)] = &[
     ("Window (ctrl+b then)", "[", "copy mode"),
     ("Window (ctrl+b then)", "b", "toggle sidebar"),
     ("Mouse", "drag borders", "resize panes and sidebar"),
+    ("Mouse", "drag a project", "reorder projects (remembered)"),
     ("Mouse", "drag text", "select and copy"),
     ("Mouse", "double-click", "select word"),
 ];

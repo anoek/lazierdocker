@@ -17,7 +17,9 @@ clipboard. Shells, `docker attach` and logs run in embedded terminals powered by
   time order with a label per replica, summed CPU and memory, and the processes of all replicas. Env and
   Config show the first replica.
 - **Other resources:** standalone containers, images, volumes and networks, each in a collapsible section of the
-  sidebar tree. Projects can also be collapsed.
+  sidebar tree. Projects can also be collapsed, and dragged with the mouse to reorder them. The order is kept
+  between runs, in `$XDG_STATE_HOME/lazierdocker/project-order` (`~/.local/state/…` by default;
+  `~/Library/Application Support/…` on macOS).
 - **Inspector tabs:**
   - Containers and services: Logs, Stats (CPU and memory graphs), Env, Config (summary plus the full inspect
     output as YAML) and Top.

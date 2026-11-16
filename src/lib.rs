@@ -16,6 +16,7 @@
 //! - [`doc`]: read-only documents (inspect output, env, top, stats graphs).
 //! - [`term`]: embedded terminals (libghostty-vt): shells, attach, logs.
 //! - [`event`]: messages from background tasks to the event loop.
+//! - [`state`]: UI state saved between runs (the project order).
 //!
 //! # Flow
 //!
@@ -30,5 +31,6 @@ pub mod clipboard;
 pub mod doc;
 pub mod docker;
 pub mod event;
+pub mod state;
 pub mod term;
 pub mod ui;

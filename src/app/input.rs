@@ -433,6 +433,26 @@ impl App {
                     sel.drag(pos);
                 }
             }
+            Drag::Project { name, moved } => {
+                // Past the list's edges, scroll it and use its edge row.
+                let list = self.hits.sidebar.list_area;
+                let (rows, height) = (self.rows.len(), list.height as usize);
+                let row = if row < list.y {
+                    self.sidebar.scroll_by(rows, height, -1);
+                    list.y
+                } else if row >= list.bottom() {
+                    self.sidebar.scroll_by(rows, height, 1);
+                    list.bottom().saturating_sub(1)
+                } else {
+                    row
+                };
+                let onto = self.project_at_row(row);
+                if onto.is_some_and(|onto| self.move_project(&name, &onto)) {
+                    self.drag = Some(Drag::Project { name, moved: true });
+                } else {
+                    self.drag = Some(Drag::Project { name, moved });
+                }
+            }
             Drag::SidebarWidth => {
                 let max = MAX_WIDTH.min(self.size.0.saturating_sub(20)).max(MIN_WIDTH);
                 self.sidebar.width = (col + 1).clamp(MIN_WIDTH, max);
@@ -469,6 +489,8 @@ impl App {
             Drag::SidebarWidth | Drag::Split { .. } => {
                 self.drag_to(drag, col, row);
             }
+            Drag::Project { moved: true, .. } => return vec![Effect::SaveProjectOrder(self.project_order.clone())],
+            Drag::Project { moved: false, .. } => {}
         }
         Vec::new()
     }
@@ -519,6 +541,9 @@ impl App {
             if double && self.rows.iter().any(|r| r.key == key && r.expandable) {
                 self.sidebar.toggle(&key);
                 self.rebuild_rows();
+            } else if let NodeKey::Project(name) = key {
+                // Dragging a project moves it among the others.
+                self.drag = Some(Drag::Project { name, moved: false });
             }
             return Vec::new();
         }

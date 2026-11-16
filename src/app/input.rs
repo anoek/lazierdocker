@@ -145,6 +145,11 @@ impl App {
                     self.rebuild_rows();
                 }
             }
+            KeyCode::Char('[') | KeyCode::Char(']') => {
+                if let Some(id) = self.primary_inspector() {
+                    self.cycle_tab(id, if k.code == KeyCode::Char('[') { -1 } else { 1 });
+                }
+            }
             KeyCode::Char('e') => {
                 self.sidebar.show_exited = !self.sidebar.show_exited;
                 self.rebuild_rows();
@@ -165,15 +170,61 @@ impl App {
     }
 
     fn pane_key(&mut self, k: KeyEvent) -> Vec<Effect> {
+        let id = self.layout.focus;
+        let page = self.hits.content.iter().find(|(p, _)| *p == id).map(|(_, r)| r.height.max(1) as i32).unwrap_or(10);
         match k.code {
-            KeyCode::Char('q') => vec![Effect::Quit],
+            KeyCode::Char('q') => return vec![Effect::Quit],
             KeyCode::Esc | KeyCode::BackTab | KeyCode::Tab => {
                 if self.sidebar_visible {
                     self.focus = Focus::Sidebar;
                 }
-                Vec::new()
             }
-            _ => Vec::new(),
+            KeyCode::Char('[') => self.cycle_tab(id, -1),
+            KeyCode::Char(']') => self.cycle_tab(id, 1),
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_pane(id, 1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_pane(id, -1),
+            KeyCode::PageDown | KeyCode::Char('J') => self.scroll_pane(id, page),
+            KeyCode::PageUp | KeyCode::Char('K') => self.scroll_pane(id, -page),
+            KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_pane(id, page / 2),
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_pane(id, -page / 2),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll_pane(id, i32::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => self.scroll_pane_end(id),
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// The pane `[`/`]` act on from the sidebar: the focused pane if it is an
+    /// inspector, otherwise the first inspector.
+    pub fn primary_inspector(&self) -> Option<crate::ui::layout::PaneId> {
+        let focus = self.layout.focus;
+        if matches!(self.panes.get(&focus).map(|p| &p.kind), Some(super::PaneKind::Inspector)) {
+            return Some(focus);
+        }
+        self.layout
+            .panes()
+            .into_iter()
+            .find(|id| matches!(self.panes.get(id).map(|p| &p.kind), Some(super::PaneKind::Inspector)))
+    }
+
+    pub fn scroll_pane(&mut self, id: crate::ui::layout::PaneId, delta: i32) {
+        if let Some(p) = self.panes.get_mut(&id) {
+            match &mut p.content {
+                super::Content::Doc(d) => d.scroll_by(delta),
+            }
+            self.dirty = true;
+        }
+    }
+
+    fn scroll_pane_end(&mut self, id: crate::ui::layout::PaneId) {
+        if let Some(p) = self.panes.get_mut(&id) {
+            match &mut p.content {
+                super::Content::Doc(d) => {
+                    d.scroll_bottom();
+                    d.follow = true;
+                }
+            }
+            self.dirty = true;
         }
     }
 
@@ -310,6 +361,12 @@ impl App {
             });
             return Vec::new();
         }
+        if let Some((_, id, tab)) = self.hits.tabs.iter().find(|(r, _, _)| contains(*r, col, row)).cloned() {
+            self.focus = Focus::Panes;
+            self.layout.focus = id;
+            self.set_tab(id, tab);
+            return Vec::new();
+        }
         if let Some((id, _, _)) = self.hits.panes.iter().find(|(_, r, _)| contains(*r, col, row)).cloned() {
             self.focus = Focus::Panes;
             self.layout.focus = id;
@@ -322,6 +379,10 @@ impl App {
             let h = self.hits.sidebar.list_area.height as usize;
             self.sidebar.scroll_by(self.rows.len(), h, delta);
             self.dirty = true;
+            return Vec::new();
+        }
+        if let Some((id, _, _)) = self.hits.panes.iter().find(|(_, r, _)| contains(*r, col, row)).cloned() {
+            self.scroll_pane(id, delta);
         }
         Vec::new()
     }

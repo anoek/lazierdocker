@@ -6,8 +6,12 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
-use super::{App, Focus, Hits, Mode, PaneKind};
+use ratatui::style::Modifier;
+
+use super::inspect::{kind_of, tabs_for};
+use super::{App, Content, Focus, Hits, Mode, PaneKind};
 use crate::ui::borders::{self, PaneFrame};
+use crate::ui::layout::PaneId;
 use crate::ui::sidebar::{NodeKey, RenderCtx};
 use crate::ui::statusbar::{self, Status};
 
@@ -56,8 +60,7 @@ impl App {
 
         // Panes.
         let rects = self.layout.rects(pane_area);
-        let titles: Vec<(crate::ui::layout::PaneId, String)> =
-            rects.iter().map(|(id, _)| (*id, self.pane_title(*id))).collect();
+        let titles: Vec<(PaneId, String)> = rects.iter().map(|(id, _)| (*id, self.pane_title(*id))).collect();
         let frames: Vec<PaneFrame<'_>> = rects
             .iter()
             .zip(titles.iter())
@@ -72,7 +75,7 @@ impl App {
         for (id, rect) in &rects {
             let inner = inners.get(id).copied().unwrap_or_default();
             hits.panes.push((*id, *rect, inner));
-            self.render_pane(buf, *id, inner);
+            self.render_pane(buf, *id, inner, &mut hits);
         }
         hits.splits = self.layout.splits(pane_area);
 
@@ -80,12 +83,13 @@ impl App {
         self.hits = hits;
     }
 
-    pub fn pane_title(&self, id: crate::ui::layout::PaneId) -> String {
+    pub fn pane_title(&self, id: PaneId) -> String {
         match self.panes.get(&id).map(|p| &p.kind) {
             Some(PaneKind::Inspector) => match self.selected() {
                 Some(key) => self.target_label(key),
                 None => "inspector".into(),
             },
+            Some(PaneKind::Pinned(key)) => format!("📌 {}", self.target_label(key)),
             None => String::new(),
         }
     }
@@ -116,28 +120,55 @@ impl App {
         }
     }
 
-    fn render_pane(&mut self, buf: &mut Buffer, _id: crate::ui::layout::PaneId, inner: Rect) {
+    fn render_pane(&mut self, buf: &mut Buffer, id: PaneId, inner: Rect, hits: &mut Hits) {
         if inner.width == 0 || inner.height == 0 {
             return;
         }
         let t = self.theme;
-        let msg = if !self.loaded {
-            match &self.docker_error {
+        if !self.loaded {
+            let msg = match &self.docker_error {
                 Some(e) => format!("Cannot reach docker: {e}"),
                 None => "Connecting to docker…".to_string(),
+            };
+            buf.set_line(
+                inner.x + 1,
+                inner.y,
+                &Line::from(Span::styled(msg, Style::default().fg(t.subtext0))),
+                inner.width.saturating_sub(1),
+            );
+            return;
+        }
+        let mut content_area = inner;
+        if let (Some(target), Some(active)) = (self.pane_target(id), self.pane_tab(id)) {
+            let tabs = tabs_for(kind_of(&target));
+            let mut x = inner.x;
+            for tab in tabs {
+                let label = format!(" {} ", tab.title());
+                let w = label.chars().count() as u16;
+                if x + w > inner.right() {
+                    break;
+                }
+                let style = if *tab == active {
+                    Style::default().bg(t.accent).fg(t.panel_bg).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(t.overlay1)
+                };
+                buf.set_string(x, inner.y, &label, style);
+                hits.tabs.push((Rect::new(x, inner.y, w, 1), id, *tab));
+                x += w + 1;
             }
-        } else {
-            match self.selected() {
-                Some(k) => self.target_label(k),
-                None => "Nothing selected".into(),
+            content_area = Rect::new(inner.x, inner.y + 1, inner.width, inner.height.saturating_sub(1));
+        }
+        // One column of breathing room from the left frame.
+        if content_area.width > 2 {
+            content_area = Rect::new(content_area.x + 1, content_area.y, content_area.width - 1, content_area.height);
+        }
+        if let Some(pane) = self.panes.get_mut(&id) {
+            match &mut pane.content {
+                Content::Doc(d) => d.render(buf, content_area),
             }
-        };
-        buf.set_line(
-            inner.x + 1,
-            inner.y,
-            &Line::from(Span::styled(msg, Style::default().fg(t.subtext0))),
-            inner.width.saturating_sub(1),
-        );
+        }
+        hits.content.push((id, content_area));
     }
 
     fn render_status(&self, buf: &mut Buffer, area: Rect) {

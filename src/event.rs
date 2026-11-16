@@ -1,6 +1,10 @@
 //! Events delivered to the app loop from background tasks.
 
+use ratatui::text::Line;
+
+use crate::app::inspect::ContentKey;
 use crate::docker::model::Snapshot;
+use crate::ui::layout::PaneId;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -8,6 +12,8 @@ pub enum AppEvent {
     Snapshot(Box<Snapshot>),
     /// The daemon could not be reached / the events stream failed.
     DockerError(String),
+    /// Loaded document content for a pane.
+    Doc { pane: PaneId, key: ContentKey, lines: Vec<Line<'static>> },
 }
 
 pub type EventTx = tokio::sync::mpsc::UnboundedSender<AppEvent>;

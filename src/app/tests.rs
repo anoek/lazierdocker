@@ -133,3 +133,99 @@ fn docker_error_shown_in_status() {
     assert!(row_text(&buf, 9).contains("⚠ connection refused"));
     assert!(screen(&buf).contains("Cannot reach docker"));
 }
+
+mod inspector {
+    use super::*;
+    use crate::app::inspect::{tabs_for, LoadSpec, Tab, TargetKind};
+    use ratatui::text::Line;
+
+    fn select(app: &mut App, key: NodeKey) {
+        let rows = app.rows().to_vec();
+        app.sidebar.select(&rows, &key);
+    }
+
+    #[test]
+    fn tabs_for_kinds() {
+        assert_eq!(tabs_for(TargetKind::Container), &[Tab::Logs, Tab::Stats, Tab::Env, Tab::Config, Tab::Top]);
+        assert_eq!(tabs_for(TargetKind::Project), &[Tab::Logs, Tab::Config]);
+        assert_eq!(tabs_for(TargetKind::Image), &[Tab::Config]);
+        assert_eq!(tabs_for(TargetKind::Section), &[Tab::Summary]);
+    }
+
+    #[test]
+    fn config_tab_requests_inspect_and_applies_matching_result() {
+        let mut app = loaded_app();
+        let id = app.snap.containers.iter().find(|c| c.name == "loner").unwrap().id.clone();
+        select(&mut app, NodeKey::Container(id.clone()));
+        let pane = app.layout.focus;
+        app.set_tab(pane, Tab::Config);
+        let effects = app.sync_panes();
+        let Some(Effect::Load { key, spec, .. }) = effects.first().cloned() else { panic!("{effects:?}") };
+        assert_eq!(spec, LoadSpec::ContainerConfig { id: id.clone() });
+        // Nothing new to load on a second sync.
+        assert!(app.sync_panes().is_empty());
+        // A stale result (different key) is ignored; the matching one is shown.
+        let mut stale = key.clone();
+        stale.rev += 1;
+        app.handle_app_event(AppEvent::Doc { pane, key: stale, lines: vec![Line::raw("STALE")] });
+        app.handle_app_event(AppEvent::Doc { pane, key, lines: vec![Line::raw("ID: loner-id")] });
+        let s = screen(&draw(&mut app, 100, 20));
+        assert!(s.contains("ID: loner-id") && !s.contains("STALE"), "{s}");
+        assert!(s.contains(" Config "), "tab bar shown: {s}");
+    }
+
+    #[test]
+    fn service_tabs_resolve_to_its_container() {
+        let mut app = loaded_app();
+        select(&mut app, NodeKey::Service("demo".into(), "web".into()));
+        let pane = app.layout.focus;
+        app.set_tab(pane, Tab::Env);
+        let effects = app.sync_panes();
+        assert!(
+            matches!(&effects[0], Effect::Load { spec: LoadSpec::ContainerEnv { id }, .. } if id.starts_with("demo-web-1"))
+        );
+    }
+
+    #[test]
+    fn click_tab_and_bracket_keys_switch_tabs() {
+        let mut app = loaded_app();
+        let id = app.snap.containers.iter().find(|c| c.name == "loner").unwrap().id.clone();
+        select(&mut app, NodeKey::Container(id));
+        app.sync_panes();
+        draw(&mut app, 100, 20);
+        let (rect, pane, _) = *app.hits.tabs.iter().find(|(_, _, t)| *t == Tab::Top).unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), rect.x + 1, rect.y));
+        assert_eq!(app.pane_tab(pane), Some(Tab::Top));
+        app.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(app.pane_tab(pane), Some(Tab::Logs), "wraps around");
+        // From the sidebar, [ ] drive the inspector too.
+        app.focus = Focus::Sidebar;
+        app.handle_key(key(KeyCode::Char('[')));
+        assert_eq!(app.pane_tab(pane), Some(Tab::Top));
+    }
+
+    #[test]
+    fn section_summary_is_immediate() {
+        let mut app = loaded_app();
+        select(&mut app, NodeKey::Section(crate::ui::sidebar::Section::Containers));
+        assert!(app.sync_panes().is_empty());
+        let s = screen(&draw(&mut app, 120, 20));
+        assert!(s.contains("STATE") && s.contains("loner"), "{s}");
+    }
+
+    #[test]
+    fn wheel_scrolls_pane_under_pointer() {
+        let mut app = loaded_app();
+        let pane = app.layout.focus;
+        app.panes.get_mut(&pane).unwrap().content =
+            Content::Doc(crate::doc::DocSurface::new((0..100).map(|i| Line::raw(i.to_string())).collect()));
+        app.panes.get_mut(&pane).unwrap().loaded = None;
+        // Pin the loaded key so sync doesn't replace our content.
+        select(&mut app, NodeKey::Section(crate::ui::sidebar::Section::Volumes));
+        draw(&mut app, 100, 20);
+        let (_, r, _) = app.hits.panes[0];
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, r.x + 5, r.y + 5));
+        let Content::Doc(d) = &app.panes[&pane].content;
+        assert_eq!(d.scroll, 3);
+    }
+}

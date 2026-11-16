@@ -5,6 +5,8 @@
 //! as [`AppEvent`]s.
 
 pub mod input;
+pub mod inspect;
+pub mod loader;
 pub mod render;
 pub mod run;
 
@@ -13,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
+use crate::doc::DocSurface;
 use crate::docker::model::Snapshot;
 use crate::event::AppEvent;
 use crate::ui::layout::{Layout, PaneId, SplitBorder, SplitDir};
@@ -49,6 +52,9 @@ pub struct Hits {
     /// (pane, outer rect, inner content rect)
     pub panes: Vec<(PaneId, Rect, Rect)>,
     pub splits: Vec<SplitBorder>,
+    pub tabs: Vec<(Rect, PaneId, inspect::Tab)>,
+    /// Content rect (below the tab bar) per pane.
+    pub content: Vec<(PaneId, Rect)>,
 }
 
 /// Work for the runtime. Kept as data so input handling is testable.
@@ -56,17 +62,35 @@ pub struct Hits {
 pub enum Effect {
     Quit,
     RefreshNow,
+    Load { pane: PaneId, key: inspect::ContentKey, spec: inspect::LoadSpec },
 }
 
 #[derive(Debug, Clone)]
 pub enum PaneKind {
     /// Follows the sidebar selection.
     Inspector,
+    /// Shows one item regardless of selection.
+    Pinned(NodeKey),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+pub enum Content {
+    Doc(DocSurface),
+}
+
+#[derive(Debug)]
 pub struct Pane {
     pub kind: PaneKind,
+    /// Selected tab per item kind (lazydocker keeps the tab per panel).
+    pub tabs: HashMap<inspect::TargetKind, inspect::Tab>,
+    pub content: Content,
+    pub loaded: Option<inspect::ContentKey>,
+}
+
+impl Pane {
+    pub fn new(kind: PaneKind) -> Self {
+        Self { kind, tabs: HashMap::new(), content: Content::Doc(DocSurface::default()), loaded: None }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,6 +107,8 @@ pub struct App {
     pub theme: Theme,
     pub host: String,
     pub snap: Snapshot,
+    /// Increments on every snapshot (summary content revision).
+    pub snap_generation: u64,
     pub loaded: bool,
     pub docker_error: Option<String>,
     pub sidebar: Sidebar,
@@ -107,11 +133,12 @@ impl App {
     pub fn new(host: impl Into<String>) -> Self {
         let first = PaneId(1);
         let mut panes = HashMap::new();
-        panes.insert(first, Pane { kind: PaneKind::Inspector });
+        panes.insert(first, Pane::new(PaneKind::Inspector));
         let mut app = Self {
             theme: Theme::default(),
             host: host.into(),
             snap: Snapshot::default(),
+            snap_generation: 0,
             loaded: false,
             docker_error: None,
             sidebar: Sidebar::default(),
@@ -163,6 +190,7 @@ impl App {
             AppEvent::Snapshot(s) => {
                 let first_load = !self.loaded;
                 self.snap = *s;
+                self.snap_generation += 1;
                 self.loaded = true;
                 self.docker_error = None;
                 self.cpu.retain(|id, _| self.snap.containers.iter().any(|c| &c.id == id));
@@ -179,6 +207,16 @@ impl App {
             AppEvent::DockerError(e) => {
                 self.docker_error = Some(e);
                 self.dirty = true;
+            }
+            AppEvent::Doc { pane, key, lines } => {
+                if let Some(p) = self.panes.get_mut(&pane) {
+                    if p.loaded.as_ref() == Some(&key) {
+                        match &mut p.content {
+                            Content::Doc(d) => d.set_lines(lines),
+                        }
+                        self.dirty = true;
+                    }
+                }
             }
         }
         Vec::new()

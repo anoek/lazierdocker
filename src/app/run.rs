@@ -30,6 +30,7 @@ pub struct Runtime {
     pub docker: Docker,
     pub tx: EventTx,
     pub refresher: Refresher,
+    pub compose_files: Vec<String>,
 }
 
 /// Restore the terminal (also used by the panic hook).
@@ -69,7 +70,7 @@ pub async fn run(opts: Options) -> Result<()> {
     let (tx, mut rx): (EventTx, EventRx) = tokio::sync::mpsc::unbounded_channel();
     let local = detect_local_compose(&opts.compose_files, opts.project.as_deref()).await;
     let refresher = spawn_refresh(docker.clone(), local, tx.clone());
-    let rt = Runtime { docker: docker.clone(), tx, refresher };
+    let rt = Runtime { docker: docker.clone(), tx, refresher, compose_files: opts.compose_files.clone() };
 
     let mut app = App::new(docker.host.clone());
     let mut term = setup_terminal()?;
@@ -96,6 +97,8 @@ pub async fn run(opts: Options) -> Result<()> {
                 Some(ev) = rx.recv() => app.handle_app_event(ev),
                 _ = tokio::time::sleep(wait) => Vec::new(),
             };
+            let mut effects = effects;
+            effects.extend(app.sync_panes());
             for e in effects {
                 rt.execute(&mut app, e);
             }
@@ -114,6 +117,16 @@ impl Runtime {
         match effect {
             Effect::Quit => app.quit = true,
             Effect::RefreshNow => self.refresher.poke(),
+            Effect::Load { pane, key, spec } => {
+                let docker = self.docker.clone();
+                let tx = self.tx.clone();
+                let files = self.compose_files.clone();
+                let theme = app.theme;
+                tokio::spawn(async move {
+                    let lines = super::loader::load(&docker, spec, &files, &theme).await;
+                    let _ = tx.send(crate::event::AppEvent::Doc { pane, key, lines });
+                });
+            }
         }
     }
 }

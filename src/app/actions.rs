@@ -18,8 +18,6 @@ pub enum Action {
     SplitPane(PaneId, SplitDir),
     ClosePane(PaneId),
     ZoomPane(PaneId),
-    /// Turn a pinned pane back into a follow-the-selection inspector.
-    Unpin(PaneId),
     /// Reload a logs pane with the whole history.
     FullLogs(PaneId),
     Copy(String),
@@ -81,13 +79,6 @@ impl App {
                 self.layout.focus = id;
                 self.focus = Focus::Panes;
                 self.layout.toggle_zoom();
-                Vec::new()
-            }
-            Action::Unpin(id) => {
-                if let Some(p) = self.panes.get_mut(&id) {
-                    p.kind = PaneKind::Inspector;
-                    p.loaded = None;
-                }
                 Vec::new()
             }
             Action::FullLogs(id) => {
@@ -176,9 +167,6 @@ impl App {
         if self.layout.panes().len() > 1 {
             let label = if self.layout.zoomed { "Unzoom" } else { "Zoom" };
             items.push(MenuItem::new(label, Action::ZoomPane(id)).key("^b z"));
-        }
-        if matches!(self.panes.get(&id).map(|p| &p.kind), Some(PaneKind::Pinned(_))) {
-            items.push(MenuItem::new("Follow selection", Action::Unpin(id)));
         }
         items.push(MenuItem::new("Close pane", Action::ClosePane(id)).key("^b x").danger());
         Menu::new(self.pane_title(id), items)

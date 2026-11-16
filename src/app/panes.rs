@@ -43,6 +43,68 @@ impl App {
         self.dirty = true;
     }
 
+    /// Panes that show docker items (not terminals).
+    fn is_content_pane(&self, id: PaneId) -> bool {
+        matches!(self.panes.get(&id).map(|p| &p.kind), Some(PaneKind::Inspector | PaneKind::Pinned(_)))
+    }
+
+    /// The pane the sidebar drives: the focused pane, or when a terminal has
+    /// focus, the previously active pane, else the first content pane.
+    fn sidebar_pane(&self) -> Option<PaneId> {
+        let panes = self.layout.panes();
+        [Some(self.layout.focus), self.active]
+            .into_iter()
+            .flatten()
+            .find(|id| panes.contains(id) && self.is_content_pane(*id))
+            .or_else(|| panes.into_iter().find(|id| self.is_content_pane(*id)))
+    }
+
+    /// Keep exactly one pane following the sidebar: the active one. Other
+    /// panes are pinned to what they show, and the sidebar highlights the
+    /// active pane's item, so picking an item changes the pane you are in.
+    pub fn sync_active_pane(&mut self) {
+        let Some(active) = self.sidebar_pane() else { return };
+        let follows = matches!(self.panes.get(&active).map(|p| &p.kind), Some(PaneKind::Inspector));
+        if self.active == Some(active) && follows {
+            return;
+        }
+        let selected = self.selected().cloned();
+        for id in self.layout.panes() {
+            if id == active {
+                continue;
+            }
+            if let Some(p) = self.panes.get_mut(&id).filter(|p| matches!(p.kind, PaneKind::Inspector)) {
+                if let Some(shown) = p.loaded.as_ref().map(|k| k.target.clone()).or_else(|| selected.clone()) {
+                    p.kind = PaneKind::Pinned(shown);
+                }
+            }
+        }
+        if let Some(PaneKind::Pinned(key)) = self.panes.get(&active).map(|p| p.kind.clone()) {
+            if self.reveal_in_sidebar(&key) {
+                let rows = self.rows.clone();
+                self.sidebar.select(&rows, &key);
+                if let Some(p) = self.panes.get_mut(&active) {
+                    p.kind = PaneKind::Inspector;
+                }
+            }
+        }
+        self.active = Some(active);
+        self.dirty = true;
+    }
+
+    /// Expand the groups holding `key` so its sidebar row exists. False when
+    /// it still has no row (filtered out or a hidden exited container).
+    fn reveal_in_sidebar(&mut self, key: &NodeKey) -> bool {
+        if !self.rows.iter().any(|r| &r.key == key) {
+            self.sidebar.set_expanded(&NodeKey::Section(crate::ui::sidebar::section_of(key)), true);
+            if let NodeKey::Service(p, _) = key {
+                self.sidebar.set_expanded(&NodeKey::Project(p.clone()), true);
+            }
+            self.rebuild_rows();
+        }
+        self.rows.iter().any(|r| &r.key == key)
+    }
+
     /// prefix+v / prefix+-: a new pane pinned to the current selection.
     pub fn split_focused(&mut self, dir: SplitDir) {
         let kind = match self.selected() {

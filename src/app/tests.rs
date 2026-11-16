@@ -435,8 +435,10 @@ mod streams {
 
 mod windows {
     use super::*;
+    use crate::app::actions::Action;
     use crate::app::inspect::Tab;
     use crate::ui::layout::SplitDir;
+    use crate::ui::sidebar::Section;
 
     fn prefix(app: &mut App, c: char) -> Vec<Effect> {
         app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
@@ -465,6 +467,82 @@ mod windows {
         assert!(s.contains("◆ loner"), "{s}");
         prefix(&mut app, '-');
         assert_eq!(app.layout.splits(app.hits.pane_area).iter().filter(|s| s.dir == SplitDir::Vertical).count(), 1);
+    }
+
+    fn click_pane(app: &mut App, id: PaneId) {
+        draw(app, 120, 30);
+        let (_, _, inner) = *app.hits.panes.iter().find(|(p, _, _)| *p == id).unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), inner.x + 2, inner.y + 3));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), inner.x + 2, inner.y + 3));
+        app.sync_panes();
+    }
+
+    fn pick(app: &mut App, k: &NodeKey) {
+        app.focus = Focus::Sidebar;
+        let rows = app.rows().to_vec();
+        app.sidebar.select(&rows, k);
+        app.sync_panes();
+    }
+
+    #[test]
+    fn sidebar_drives_the_focused_pane() {
+        let mut app = loaded_app();
+        let loner = select_loner(&mut app);
+        draw(&mut app, 120, 30);
+        app.sync_panes();
+        let first = app.layout.focus;
+        prefix(&mut app, 'v');
+        let second = app.layout.focus;
+        app.sync_panes();
+        // Picking an item changes the pane last focused, not the first one.
+        let web = NodeKey::Service("demo".into(), "web".into());
+        pick(&mut app, &web);
+        assert_eq!(app.pane_target(second), Some(web.clone()));
+        assert_eq!(app.pane_target(first), Some(loner.clone()));
+        let s = screen(&draw(&mut app, 120, 30));
+        assert!(s.contains("◆ loner") && !s.contains("◆ demo › web"), "only the other pane is pinned: {s}");
+        // Focusing the first pane highlights its item and makes it the one driven.
+        click_pane(&mut app, first);
+        assert_eq!(app.layout.focus, first);
+        assert_eq!(app.selected(), Some(&loner));
+        let db = NodeKey::Service("demo".into(), "db".into());
+        pick(&mut app, &db);
+        assert_eq!(app.pane_target(first), Some(db));
+        assert_eq!(app.pane_target(second), Some(web));
+    }
+
+    #[test]
+    fn sidebar_drives_the_last_content_pane_while_a_terminal_has_focus() {
+        let mut app = loaded_app();
+        select_loner(&mut app);
+        draw(&mut app, 120, 30);
+        prefix(&mut app, 'v');
+        let second = app.layout.focus;
+        app.sync_panes();
+        app.perform(Action::RunInPane { title: "sh".into(), argv: vec!["true".into()] });
+        assert_ne!(app.layout.focus, second, "the terminal has focus");
+        let web = NodeKey::Service("demo".into(), "web".into());
+        pick(&mut app, &web);
+        assert_eq!(app.pane_target(second), Some(web));
+    }
+
+    #[test]
+    fn focusing_a_pane_reveals_its_item_in_the_sidebar() {
+        let mut app = loaded_app();
+        let loner = select_loner(&mut app);
+        draw(&mut app, 120, 30);
+        let first = app.layout.focus;
+        prefix(&mut app, 'v');
+        app.sync_panes();
+        let web = NodeKey::Service("demo".into(), "web".into());
+        pick(&mut app, &web);
+        // Collapse the section holding the other pane's item, then focus it.
+        app.sidebar.set_expanded(&NodeKey::Section(Section::Containers), false);
+        app.rebuild_rows();
+        assert!(!app.rows().iter().any(|r| r.key == loner));
+        click_pane(&mut app, first);
+        assert_eq!(app.selected(), Some(&loner));
+        assert!(app.rows().iter().any(|r| r.key == loner), "section expanded again");
     }
 
     #[test]

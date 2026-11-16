@@ -184,6 +184,7 @@ impl App {
     /// Bring every pane's content in line with what it should show. Returns
     /// effects for content the runtime must fetch or start.
     pub fn sync_panes(&mut self) -> Vec<Effect> {
+        self.sync_active_pane();
         let mut effects = Vec::new();
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
         for id in ids {

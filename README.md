@@ -35,8 +35,9 @@ clipboard. Shells, `docker attach` and logs run in embedded terminals powered by
 - **Mouse:** click to select, focus and switch tabs. Drag split borders and the sidebar edge to resize.
   Double-click the sidebar edge to reset its width. The scroll wheel scrolls whatever is under the pointer.
 - **Context menus:** right-click on any item or pane. Menus highlight on hover.
-- **Split panes:** split with `ctrl+b v` / `ctrl+b -`. A new pane is pinned to the selected item, so you can watch
-  the logs of one container while browsing others. You can also zoom, swap, close and change focus by direction.
+- **Split panes:** split with `ctrl+b v` / `ctrl+b -`. The sidebar changes only the pane you last focused. The other
+  panes keep showing their item (marked ◆), so you can watch the logs of one container while browsing others.
+  Focusing a pane highlights its item in the sidebar. You can also zoom, swap, close and change focus by direction.
 - **Embedded terminals (libghostty):**
   - `E` opens an exec shell; `a` attaches to the container.
   - Attached compose commands (rebuild, pull, …) also run in a pane.

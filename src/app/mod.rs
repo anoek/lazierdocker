@@ -206,6 +206,8 @@ pub struct App {
     pub mode: Mode,
     pub layout: Layout,
     pub panes: HashMap<PaneId, Pane>,
+    /// The pane the sidebar drives (see `sync_active_pane`).
+    pub active: Option<PaneId>,
     next_pane: u64,
     pub hits: Hits,
     pub drag: Option<Drag>,
@@ -258,6 +260,7 @@ impl App {
             mode: Mode::Normal,
             layout: Layout::new(first),
             panes,
+            active: None,
             next_pane: 2,
             hits: Hits::default(),
             drag: None,

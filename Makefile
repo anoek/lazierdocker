@@ -20,7 +20,7 @@ TARGET := target/release/$(BIN)
 # rustup and our Zig live in the user's home and may not be on PATH.
 export PATH := $(HOME)/.cargo/bin:$(HOME)/.local/bin:$(PATH)
 
-.PHONY: all build run install uninstall test clean
+.PHONY: all build run install uninstall test clean screenshot
 
 all: build
 
@@ -44,3 +44,10 @@ test:
 
 clean:
 	$(CARGO) clean
+
+# README screenshot from made-up state (needs chromium and ImageMagick).
+screenshot:
+	$(CARGO) run --example screenshot -- target/screenshot.html
+	chromium --headless=new --disable-gpu --hide-scrollbars --force-device-scale-factor=2 \
+		--window-size=1500,900 --screenshot=target/screenshot-raw.png "file://$(CURDIR)/target/screenshot.html"
+	magick target/screenshot-raw.png -fuzz 1% -trim +repage -bordercolor '#1e1e2e' -border 28 docs/screenshot.png

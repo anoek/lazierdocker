@@ -6,19 +6,7 @@ a collapsible resource tree, right-click context menus, modal menus, and text se
 clipboard. Shells, `docker attach` and logs run in embedded terminals powered by
 [libghostty](https://github.com/ghostty-org/ghostty).
 
-```
- lazierdocker                          ┌─ demo › worker ──────────────────┬─ exec loner ───────────────────┐
-▾ Projects 1                           │ Logs   Stats   Env   Config   Top │ / # ls /                       │
- ▾ demo 3/3 ●                          │ CPU (%): 0.08 (2m10s)             │ bin  dev  etc  home  lib  ...  │
-   ├ ▶ db                         0.33%│     1.0 │                         │ / #                            │
-   ├ ▶ web                        0.00%│         │          ▂▅▄▅▃▅▆▅▄▃▅▄▅  │                                │
-   └ ▶ worker                     0.08%│     0.0 │▃▄▅▃▄▅▄▃▅▄▃▄▅▄▃▅▄▅▄▃▅▄▅  │                                │
-▾ Containers 2                         │                                   │                                │
-  ▶ loner                         0.00%│ Memory (%): 0.00 (2m10s)          │                                │
-  ⨯ exited (0)                         │ …                                 │                                │
-▸ Images 4                             │                                   │                                │
- ↑↓ select  ←→ fold  / filter  e exited  enter pane  ^b window  q quit                tcp://127.0.0.1:23750
-```
+![lazierdocker: a compose project's logs with a search active, above a pinned postgres pane showing CPU and memory graphs](docs/screenshot.png)
 
 ## Features
 
@@ -112,7 +100,8 @@ crate uses Zig to build libghostty-vt from a pinned Ghostty commit, which the fi
     make install              # → ~/.local/bin/lazierdocker (PREFIX=/usr/local for system-wide)
     make uninstall            # same PREFIX as install
 
-`make test` and `make clean` are also available.
+`make test` and `make clean` are also available. `make screenshot` regenerates `docs/screenshot.png` from
+made-up state (needs Chromium and ImageMagick).
 
 Linux and macOS are supported.
 

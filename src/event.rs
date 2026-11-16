@@ -4,6 +4,7 @@ use ratatui::text::Line;
 
 use crate::app::inspect::ContentKey;
 use crate::docker::model::Snapshot;
+use crate::docker::stats::StatsSample;
 use crate::ui::layout::PaneId;
 
 #[derive(Debug)]
@@ -14,6 +15,14 @@ pub enum AppEvent {
     DockerError(String),
     /// Loaded document content for a pane.
     Doc { pane: PaneId, key: ContentKey, lines: Vec<Line<'static>> },
+    /// A terminal surface produced output.
+    TermActivity(PaneId),
+    /// A terminal pane's child process exited.
+    TermExited(PaneId, Option<u32>),
+    /// A container log stream ended.
+    LogsEnded(PaneId, ContentKey),
+    /// One stats sample for a container.
+    Stats(String, StatsSample),
 }
 
 pub type EventTx = tokio::sync::mpsc::UnboundedSender<AppEvent>;

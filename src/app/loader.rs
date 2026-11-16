@@ -52,6 +52,12 @@ pub async fn load(docker: &Docker, spec: LoadSpec, compose_files: &[String], t: 
                 Err(e) => error_lines(e, t),
             }
         }
+        LoadSpec::Top { id } => {
+            match docker.api.top_processes(&id, None::<bollard::query_parameters::TopOptions>).await {
+                Ok(top) => format::top(&top.titles.unwrap_or_default(), &top.processes.unwrap_or_default(), t),
+                Err(e) => error_lines(e, t),
+            }
+        }
         LoadSpec::ComposeConfig { project, local, config_files, working_dir } => {
             let mut cmd = docker_cli(&docker.host);
             cmd.arg("compose");

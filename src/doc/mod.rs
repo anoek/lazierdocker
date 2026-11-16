@@ -1,6 +1,7 @@
 //! Read-only "document" surface: styled lines with vertical scroll.
 
 pub mod format;
+pub mod graph;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;

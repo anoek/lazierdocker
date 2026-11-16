@@ -21,10 +21,14 @@ impl App {
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         self.render_buf(frame.buffer_mut(), area);
+        if let Some((x, y)) = self.cursor {
+            frame.set_cursor_position((x, y));
+        }
     }
 
     pub fn render_buf(&mut self, buf: &mut Buffer, area: Rect) {
         self.size = (area.width, area.height);
+        self.cursor = None;
         let mut hits = Hits::default();
         let t = self.theme;
         buf.set_style(area, Style::default().fg(t.text));
@@ -90,6 +94,10 @@ impl App {
                 None => "inspector".into(),
             },
             Some(PaneKind::Pinned(key)) => format!("📌 {}", self.target_label(key)),
+            Some(PaneKind::Terminal { title }) => match self.panes.get(&id).map(|p| &p.content) {
+                Some(Content::Term(t)) if t.exited().is_some() => format!("{title} (exited)"),
+                _ => title.clone(),
+            },
             None => String::new(),
         }
     }
@@ -163,9 +171,17 @@ impl App {
         if content_area.width > 2 {
             content_area = Rect::new(content_area.x + 1, content_area.y, content_area.width - 1, content_area.height);
         }
+        let focused = self.focus == Focus::Panes && self.layout.focus == id;
         if let Some(pane) = self.panes.get_mut(&id) {
+            let interactive = matches!(pane.kind, PaneKind::Terminal { .. });
             match &mut pane.content {
                 Content::Doc(d) => d.render(buf, content_area),
+                Content::Term(term) => {
+                    let cursor = term.render(buf, content_area);
+                    if focused && interactive && term.exited().is_none() {
+                        self.cursor = cursor;
+                    }
+                }
             }
         }
         hits.content.push((id, content_area));

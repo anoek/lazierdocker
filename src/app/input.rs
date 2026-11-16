@@ -211,6 +211,7 @@ impl App {
         if let Some(p) = self.panes.get_mut(&id) {
             match &mut p.content {
                 super::Content::Doc(d) => d.scroll_by(delta),
+                super::Content::Term(t) => t.scroll_lines(delta),
             }
             self.dirty = true;
         }
@@ -223,6 +224,7 @@ impl App {
                     d.scroll_bottom();
                     d.follow = true;
                 }
+                super::Content::Term(t) => t.scroll_to_bottom(),
             }
             self.dirty = true;
         }

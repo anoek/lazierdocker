@@ -5,9 +5,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::{App, Content, Effect, PaneKind};
-use crate::doc::DocSurface;
+use crate::doc::{graph, DocSurface};
 use crate::docker::model::Snapshot;
 use crate::docker::present;
+use crate::docker::stats::StatsHistory;
 use crate::ui::layout::PaneId;
 use crate::ui::sidebar::{NodeKey, Section};
 use crate::ui::theme::Theme;
@@ -86,6 +87,7 @@ pub enum LoadSpec {
     Volume { name: String },
     Network { id: String },
     ComposeConfig { project: String, local: bool, config_files: Option<String>, working_dir: Option<String> },
+    Top { id: String },
 }
 
 impl App {
@@ -94,6 +96,7 @@ impl App {
         match &self.panes.get(&id)?.kind {
             PaneKind::Inspector => self.selected().cloned(),
             PaneKind::Pinned(k) => Some(k.clone()),
+            PaneKind::Terminal { .. } => None,
         }
     }
 
@@ -143,6 +146,14 @@ impl App {
                     c.id.hash(&mut h);
                     c.state.as_str().hash(&mut h);
                     c.exit_code.hash(&mut h);
+                    match tab {
+                        Tab::Top => self.tick.hash(&mut h),
+                        Tab::Stats => {
+                            self.stats.get(&c.id).and_then(|s| s.samples.back()).map(|(t, _)| *t).hash(&mut h);
+                            self.hits.content.iter().map(|(_, r)| r.width).max().hash(&mut h);
+                        }
+                        _ => {}
+                    }
                 } else {
                     0u8.hash(&mut h);
                 }
@@ -156,15 +167,21 @@ impl App {
     }
 
     /// Bring every pane's content in line with what it should show. Returns
-    /// load effects for content that must be fetched.
+    /// effects for content the runtime must fetch or start.
     pub fn sync_panes(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
         for id in ids {
+            if matches!(self.panes.get(&id).map(|p| &p.kind), Some(PaneKind::Terminal { .. })) {
+                continue;
+            }
             let (Some(target), Some(tab)) = (self.pane_target(id), self.pane_tab(id)) else {
                 if let Some(p) = self.panes.get_mut(&id) {
-                    p.loaded = None;
-                    p.content = Content::Doc(DocSurface::message("Nothing selected"));
+                    if p.loaded.is_some() || !matches!(p.content, Content::Doc(_)) {
+                        p.stop_task();
+                        p.loaded = None;
+                        p.content = Content::Doc(DocSurface::message("Nothing selected"));
+                    }
                 }
                 continue;
             };
@@ -177,55 +194,82 @@ impl App {
                 .get(&id)
                 .and_then(|p| p.loaded.as_ref())
                 .is_some_and(|k| k.target == key.target && k.tab == key.tab);
-            let (content, spec) = self.plan_content(&target, tab);
+            let plan = self.plan_content(&target, tab, id);
             let pane = self.panes.get_mut(&id).expect("pane exists");
             pane.loaded = Some(key.clone());
-            match content {
-                Some(lines) => {
+            match plan {
+                Plan::Lines(lines) => {
                     if same_view {
-                        #[allow(irrefutable_let_patterns)] // more content kinds arrive with terminal panes
                         if let Content::Doc(d) = &mut pane.content {
                             d.set_lines(lines);
+                        } else {
+                            pane.content = Content::Doc(DocSurface::new(lines));
                         }
                     } else {
+                        pane.stop_task();
                         pane.content = Content::Doc(DocSurface::new(lines));
                     }
                 }
-                None if !same_view => pane.content = Content::Doc(DocSurface::message("Loading…")),
-                None => {}
-            }
-            if let Some(spec) = spec {
-                effects.push(Effect::Load { pane: id, key, spec });
+                Plan::Load(spec) => {
+                    if !same_view || !matches!(pane.content, Content::Doc(_)) {
+                        pane.stop_task();
+                        pane.content = Content::Doc(DocSurface::message("Loading…"));
+                    }
+                    effects.push(Effect::Load { pane: id, key, spec });
+                }
+                Plan::Logs { container_id } => {
+                    pane.stop_task();
+                    pane.content = Content::Doc(DocSurface::message("Loading…"));
+                    effects.push(Effect::StartLogs { pane: id, key, container_id });
+                }
+                Plan::Spawn { argv } => {
+                    pane.stop_task();
+                    pane.content = Content::Doc(DocSurface::message("Starting…"));
+                    effects.push(Effect::SpawnTerm { pane: id, key: Some(key), argv });
+                }
             }
             self.dirty = true;
         }
         effects
     }
 
-    /// Either immediate lines, or a spec for the runtime to fetch.
-    fn plan_content(&self, target: &NodeKey, tab: Tab) -> (Option<Vec<Line<'static>>>, Option<LoadSpec>) {
+    /// What a (target, tab) needs: immediate lines, a fetch, or a stream.
+    fn plan_content(&self, target: &NodeKey, tab: Tab, pane: PaneId) -> Plan {
         let t = &self.theme;
-        let msg = |s: &str| Some(vec![Line::styled(s.to_string(), Style::default().fg(t.overlay0))]);
+        let msg = |s: &str| Plan::Lines(vec![Line::styled(s.to_string(), Style::default().fg(t.overlay0))]);
         match (target, tab) {
-            (NodeKey::Section(s), _) => (Some(summary(*s, &self.snap, &self.cpu, t)), None),
-            (NodeKey::Container(_) | NodeKey::Service(..), Tab::Config | Tab::Env) => {
-                match self.target_container(target) {
-                    Some(c) => {
-                        let id = c.id.clone();
-                        let spec = if tab == Tab::Config {
-                            LoadSpec::ContainerConfig { id }
-                        } else {
-                            LoadSpec::ContainerEnv { id }
-                        };
-                        (None, Some(spec))
+            (NodeKey::Section(s), _) => Plan::Lines(summary(*s, &self.snap, &self.cpu, t)),
+            (NodeKey::Container(_) | NodeKey::Service(..), _) => {
+                let Some(c) = self.target_container(target) else {
+                    return msg("No logs to show; service is not associated with a container");
+                };
+                let id = c.id.clone();
+                match tab {
+                    Tab::Config => Plan::Load(LoadSpec::ContainerConfig { id }),
+                    Tab::Env => Plan::Load(LoadSpec::ContainerEnv { id }),
+                    Tab::Top if c.state == crate::docker::model::ContainerState::Running => {
+                        Plan::Load(LoadSpec::Top { id })
                     }
-                    None => (msg("Service is not associated with a container"), None),
+                    Tab::Top => msg("container is not running"),
+                    Tab::Logs => Plan::Logs { container_id: id },
+                    Tab::Stats => {
+                        let width =
+                            self.hits.content.iter().find(|(p, _)| *p == pane).map(|(_, r)| r.width).unwrap_or(80);
+                        Plan::Lines(stats_lines(self.stats.get(&id), c.is_running(), width as usize, t))
+                    }
+                    Tab::Summary => msg(""),
                 }
             }
-            (NodeKey::Image(id), _) => (None, Some(LoadSpec::Image { id: id.clone() })),
-            (NodeKey::Volume(name), _) => (None, Some(LoadSpec::Volume { name: name.clone() })),
-            (NodeKey::Network(id), _) => (None, Some(LoadSpec::Network { id: id.clone() })),
-            (NodeKey::Project(p), Tab::Config) => {
+            (NodeKey::Image(id), _) => Plan::Load(LoadSpec::Image { id: id.clone() }),
+            (NodeKey::Volume(name), _) => Plan::Load(LoadSpec::Volume { name: name.clone() }),
+            (NodeKey::Network(id), _) => Plan::Load(LoadSpec::Network { id: id.clone() }),
+            (NodeKey::Project(p), Tab::Logs) => Plan::Spawn {
+                argv: ["docker", "compose", "-p", p, "logs", "--tail=300", "--follow"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            },
+            (NodeKey::Project(p), _) => {
                 let project = self.snap.project(p);
                 let local = project.is_some_and(|p| p.local);
                 let label = |name: &str| {
@@ -235,19 +279,58 @@ impl App {
                         .find(|c| c.project.as_deref() == Some(p.as_str()))
                         .and_then(|c| c.labels.get(name).cloned())
                 };
-                (
-                    None,
-                    Some(LoadSpec::ComposeConfig {
-                        project: p.clone(),
-                        local,
-                        config_files: label("com.docker.compose.project.config_files"),
-                        working_dir: label("com.docker.compose.project.working_dir"),
-                    }),
-                )
+                Plan::Load(LoadSpec::ComposeConfig {
+                    project: p.clone(),
+                    local,
+                    config_files: label("com.docker.compose.project.config_files"),
+                    working_dir: label("com.docker.compose.project.working_dir"),
+                })
             }
-            (_, tab) => msg(&format!("{} — coming up", tab.title())).map(|l| (Some(l), None)).unwrap_or((None, None)),
         }
     }
+}
+
+enum Plan {
+    Lines(Vec<Line<'static>>),
+    Load(LoadSpec),
+    Logs { container_id: String },
+    Spawn { argv: Vec<String> },
+}
+
+/// Stats tab: CPU and memory graphs, PIDs, traffic, memory usage (lazydocker layout).
+pub fn stats_lines(h: Option<&StatsHistory>, running: bool, width: usize, t: &Theme) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(t.overlay0);
+    let Some(h) = h.filter(|h| !h.samples.is_empty()) else {
+        return vec![Line::styled(if running { "Waiting for stats…" } else { "container is not running" }, dim)];
+    };
+    let latest = h.latest().expect("non-empty");
+    let span = graph::span_label(h.span());
+    let cpu: Vec<f64> = h.samples.iter().map(|(_, s)| s.cpu_percent()).collect();
+    let mem: Vec<f64> = h.samples.iter().map(|(_, s)| s.mem_percent()).collect();
+    let mut out = vec![graph::caption(format!("CPU (%): {:.2} ({span})", latest.cpu_percent()), t.cyan)];
+    out.extend(graph::bars(&cpu, width, 8, 1.0, t.cyan, dim));
+    out.push(Line::raw(""));
+    out.push(graph::caption(format!("Memory (%): {:.2} ({span})", latest.mem_percent()), t.green));
+    out.extend(graph::bars(&mem, width, 8, 1.0, t.green, dim));
+    out.push(Line::raw(""));
+    let kv = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{k:<18}"), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::raw(v),
+        ])
+    };
+    out.push(kv("PIDs:", latest.pids.to_string()));
+    out.push(kv(
+        "Memory:",
+        format!(
+            "{} / {}",
+            present::size_binary(latest.mem_usage as i64),
+            present::size_binary(latest.mem_limit as i64)
+        ),
+    ));
+    out.push(kv("Traffic received:", present::size(latest.rx_bytes as i64)));
+    out.push(kv("Traffic sent:", present::size(latest.tx_bytes as i64)));
+    out
 }
 
 /// Section summary tables.

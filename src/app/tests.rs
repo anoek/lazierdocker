@@ -225,7 +225,107 @@ mod inspector {
         draw(&mut app, 100, 20);
         let (_, r, _) = app.hits.panes[0];
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, r.x + 5, r.y + 5));
-        let Content::Doc(d) = &app.panes[&pane].content;
+        let Content::Doc(d) = &app.panes[&pane].content else { panic!("doc expected") };
         assert_eq!(d.scroll, 3);
+    }
+}
+
+mod streams {
+    use super::*;
+    use crate::app::inspect::{stats_lines, LoadSpec, Tab};
+    use crate::docker::stats::{StatsHistory, StatsSample};
+
+    fn select(app: &mut App, key: NodeKey) {
+        let rows = app.rows().to_vec();
+        app.sidebar.select(&rows, &key);
+    }
+
+    fn loner(app: &App) -> String {
+        app.snap.containers.iter().find(|c| c.name == "loner").unwrap().id.clone()
+    }
+
+    #[test]
+    fn logs_tab_starts_stream_once() {
+        let mut app = loaded_app();
+        let id = loner(&app);
+        select(&mut app, NodeKey::Container(id.clone()));
+        let pane = app.layout.focus;
+        app.set_tab(pane, Tab::Logs);
+        let effects = app.sync_panes();
+        assert!(matches!(&effects[..], [Effect::StartLogs { container_id, .. }] if *container_id == id), "{effects:?}");
+        assert!(app.sync_panes().is_empty(), "no restart while nothing changed");
+    }
+
+    #[test]
+    fn logs_restart_when_container_restarts() {
+        let mut app = loaded_app();
+        let id = loner(&app);
+        select(&mut app, NodeKey::Container(id.clone()));
+        app.set_tab(app.layout.focus, Tab::Logs);
+        app.sync_panes();
+        let mut snap = demo_snapshot();
+        snap.containers.iter_mut().find(|c| c.id == id).unwrap().state = ContainerState::Exited;
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snap)));
+        assert!(matches!(&app.sync_panes()[..], [Effect::StartLogs { .. }]));
+    }
+
+    #[test]
+    fn project_logs_spawn_compose() {
+        let mut app = loaded_app();
+        select(&mut app, NodeKey::Project("demo".into()));
+        let effects = app.sync_panes();
+        let Some(Effect::SpawnTerm { argv, key: Some(_), .. }) = effects.first() else { panic!("{effects:?}") };
+        assert_eq!(argv.join(" "), "docker compose -p demo logs --tail=300 --follow");
+    }
+
+    #[test]
+    fn top_requires_running_container() {
+        let mut app = loaded_app();
+        let exited = app.snap.containers.iter().find(|c| c.name == "exited").unwrap().id.clone();
+        select(&mut app, NodeKey::Container(exited));
+        app.set_tab(app.layout.focus, Tab::Top);
+        assert!(app.sync_panes().is_empty());
+        assert!(screen(&draw(&mut app, 100, 20)).contains("container is not running"));
+        let id = loner(&app);
+        select(&mut app, NodeKey::Container(id.clone()));
+        app.set_tab(app.layout.focus, Tab::Top);
+        assert!(matches!(&app.sync_panes()[..], [Effect::Load { spec: LoadSpec::Top { id: i }, .. }] if *i == id));
+        // Top refreshes every tick.
+        app.tick += 1;
+        assert_eq!(app.sync_panes().len(), 1);
+    }
+
+    #[test]
+    fn snapshot_requests_stats_for_running() {
+        let mut app = App::new("x");
+        let effects = app.handle_app_event(AppEvent::Snapshot(Box::new(demo_snapshot())));
+        let Some(Effect::SyncStats(ids)) = effects.first() else { panic!("{effects:?}") };
+        assert_eq!(ids.len(), 3, "exited container excluded");
+    }
+
+    #[test]
+    fn stats_tab_renders_graphs() {
+        let t = crate::ui::theme::Theme::default();
+        let mut h = StatsHistory::default();
+        let now = std::time::Instant::now();
+        h.push(
+            now,
+            StatsSample {
+                cpu_total: 10,
+                precpu_total: 0,
+                system: 100,
+                presystem: 0,
+                online_cpus: 1,
+                pids: 3,
+                ..Default::default()
+            },
+        );
+        let text: Vec<String> = stats_lines(Some(&h), true, 60, &t)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(text[0].starts_with("CPU (%): 10.00"), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("PIDs:") && l.contains('3')));
+        assert_eq!(stats_lines(None, false, 60, &t).len(), 1);
     }
 }

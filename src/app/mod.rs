@@ -17,7 +17,9 @@ use ratatui::layout::Rect;
 
 use crate::doc::DocSurface;
 use crate::docker::model::Snapshot;
+use crate::docker::stats::StatsHistory;
 use crate::event::AppEvent;
+use crate::term::TermSurface;
 use crate::ui::layout::{Layout, PaneId, SplitBorder, SplitDir};
 use crate::ui::sidebar::{NodeKey, Row, Sidebar, SidebarHits};
 use crate::ui::theme::Theme;
@@ -62,7 +64,26 @@ pub struct Hits {
 pub enum Effect {
     Quit,
     RefreshNow,
-    Load { pane: PaneId, key: inspect::ContentKey, spec: inspect::LoadSpec },
+    Load {
+        pane: PaneId,
+        key: inspect::ContentKey,
+        spec: inspect::LoadSpec,
+    },
+    /// Stream a container's logs into the pane (bollard, follow).
+    StartLogs {
+        pane: PaneId,
+        key: inspect::ContentKey,
+        container_id: String,
+    },
+    /// Run a command in a PTY inside the pane. `key` is set for inspector
+    /// content (installed only if still current); None for terminal panes.
+    SpawnTerm {
+        pane: PaneId,
+        key: Option<inspect::ContentKey>,
+        argv: Vec<String>,
+    },
+    /// Keep one stats stream per running container.
+    SyncStats(Vec<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -71,11 +92,14 @@ pub enum PaneKind {
     Inspector,
     /// Shows one item regardless of selection.
     Pinned(NodeKey),
+    /// An interactive terminal (exec shell, attach, attached command).
+    Terminal { title: String },
 }
 
 #[derive(Debug)]
 pub enum Content {
     Doc(DocSurface),
+    Term(TermSurface),
 }
 
 #[derive(Debug)]
@@ -85,11 +109,25 @@ pub struct Pane {
     pub tabs: HashMap<inspect::TargetKind, inspect::Tab>,
     pub content: Content,
     pub loaded: Option<inspect::ContentKey>,
+    /// Background task feeding this pane (log stream); aborted when replaced.
+    pub task: Option<tokio::task::AbortHandle>,
 }
 
 impl Pane {
     pub fn new(kind: PaneKind) -> Self {
-        Self { kind, tabs: HashMap::new(), content: Content::Doc(DocSurface::default()), loaded: None }
+        Self { kind, tabs: HashMap::new(), content: Content::Doc(DocSurface::default()), loaded: None, task: None }
+    }
+
+    pub fn stop_task(&mut self) {
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+    }
+}
+
+impl Drop for Pane {
+    fn drop(&mut self) {
+        self.stop_task();
     }
 }
 
@@ -122,6 +160,11 @@ pub struct App {
     pub drag: Option<Drag>,
     pub last_click: Option<Click>,
     pub cpu: HashMap<String, f64>,
+    pub stats: HashMap<String, StatsHistory>,
+    /// Seconds since start (drives 1 s refreshes such as Top).
+    pub tick: u64,
+    /// Cursor to show (focused terminal pane).
+    pub cursor: Option<(u16, u16)>,
     pub size: (u16, u16),
     pub dirty: bool,
     pub quit: bool,
@@ -152,6 +195,9 @@ impl App {
             drag: None,
             last_click: None,
             cpu: HashMap::new(),
+            stats: HashMap::new(),
+            tick: 0,
+            cursor: None,
             size: (80, 24),
             dirty: true,
             quit: false,
@@ -175,6 +221,16 @@ impl App {
         self.dirty = true;
     }
 
+    /// Size of a pane's content area at the last render (default 80×24).
+    pub fn content_size(&self, pane: PaneId) -> (u16, u16) {
+        self.hits
+            .content
+            .iter()
+            .find(|(p, _)| *p == pane)
+            .map(|(_, r)| (r.width.max(2), r.height.max(2)))
+            .unwrap_or((80, 24))
+    }
+
     pub fn alloc_pane_id(&mut self) -> PaneId {
         let id = PaneId(self.next_pane);
         self.next_pane += 1;
@@ -187,13 +243,39 @@ impl App {
 
     pub fn handle_app_event(&mut self, ev: AppEvent) -> Vec<Effect> {
         match ev {
+            AppEvent::TermActivity(_) => self.dirty = true,
+            AppEvent::TermExited(pane, code) => {
+                if let Some(Pane { content: Content::Term(t), kind, .. }) = self.panes.get_mut(&pane) {
+                    let what =
+                        if matches!(kind, PaneKind::Terminal { .. }) { "process exited" } else { "stream ended" };
+                    match code {
+                        Some(c) => t.notice(&format!("[{what} with code {c}]")),
+                        None => t.notice(&format!("[{what}]")),
+                    }
+                    self.dirty = true;
+                }
+            }
+            AppEvent::LogsEnded(pane, key) => {
+                if let Some(Pane { content: Content::Term(t), loaded: Some(k), .. }) = self.panes.get_mut(&pane) {
+                    if *k == key {
+                        t.notice("[log stream ended]");
+                        self.dirty = true;
+                    }
+                }
+            }
+            AppEvent::Stats(id, sample) => {
+                self.cpu.insert(id.clone(), sample.cpu_percent());
+                self.stats.entry(id).or_default().push(std::time::Instant::now(), sample);
+                self.dirty = true;
+            }
             AppEvent::Snapshot(s) => {
                 let first_load = !self.loaded;
                 self.snap = *s;
                 self.snap_generation += 1;
                 self.loaded = true;
                 self.docker_error = None;
-                self.cpu.retain(|id, _| self.snap.containers.iter().any(|c| &c.id == id));
+                self.cpu.retain(|id, _| self.snap.containers.iter().any(|c| &c.id == id && c.is_running()));
+                self.stats.retain(|id, _| self.snap.containers.iter().any(|c| &c.id == id));
                 self.rebuild_rows();
                 if first_load {
                     // Select the first leaf so the inspector has something to show.
@@ -203,6 +285,8 @@ impl App {
                     }
                 }
                 self.dirty = true;
+                let running = self.snap.containers.iter().filter(|c| c.is_running()).map(|c| c.id.clone()).collect();
+                return vec![Effect::SyncStats(running)];
             }
             AppEvent::DockerError(e) => {
                 self.docker_error = Some(e);
@@ -211,8 +295,10 @@ impl App {
             AppEvent::Doc { pane, key, lines } => {
                 if let Some(p) = self.panes.get_mut(&pane) {
                     if p.loaded.as_ref() == Some(&key) {
-                        match &mut p.content {
-                            Content::Doc(d) => d.set_lines(lines),
+                        if let Content::Doc(d) = &mut p.content {
+                            d.set_lines(lines);
+                        } else {
+                            p.content = Content::Doc(DocSurface::new(lines));
                         }
                         self.dirty = true;
                     }

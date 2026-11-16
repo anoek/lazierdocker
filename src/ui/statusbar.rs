@@ -36,18 +36,18 @@ pub fn render(buf: &mut Buffer, area: Rect, s: &Status<'_>, t: &Theme) {
         spans.push(Span::styled(format!(" {desc}"), Style::default().fg(t.overlay1)));
     }
     let left = Line::from(spans);
+    // The right side never takes more than half the bar, so hints stay visible.
+    let right = s.right.as_ref().map(|(r, err)| (crate::ui::borders::truncate(r, (area.width / 2) as usize), *err));
     let right_w =
-        s.right.as_ref().map(|(r, _)| unicode_width::UnicodeWidthStr::width(r.as_str()) as u16 + 1).unwrap_or(0);
+        right.as_ref().map(|(r, _)| unicode_width::UnicodeWidthStr::width(r.as_str()) as u16 + 1).unwrap_or(0);
     let left_max = area.width.saturating_sub(right_w);
     buf.set_line(area.x, area.y, &left, left_max);
-    if let Some((text, err)) = &s.right {
-        if right_w <= area.width {
-            let style = if *err {
-                Style::default().fg(t.red).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(t.overlay0)
-            };
-            buf.set_stringn(area.right() - right_w, area.y, text, right_w as usize, style.bg(t.panel_bg));
-        }
+    if let Some((text, err)) = &right {
+        let style = if *err {
+            Style::default().fg(t.red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.overlay0)
+        };
+        buf.set_stringn(area.right() - right_w, area.y, text, right_w as usize, style.bg(t.panel_bg));
     }
 }

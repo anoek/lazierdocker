@@ -921,3 +921,23 @@ mod modes {
         assert!(app.hits.splits[0].pos < before, "{} !< {before}", app.hits.splits[0].pos);
     }
 }
+
+mod long_errors {
+    use super::*;
+
+    #[test]
+    fn long_docker_error_keeps_status_hints() {
+        let mut app = App::new("tcp://nowhere");
+        app.handle_app_event(AppEvent::DockerError(format!(
+            "listing containers: {}",
+            "very long error text ".repeat(20)
+        )));
+        let buf = draw(&mut app, 100, 10);
+        let status = row_text(&buf, 9);
+        assert!(status.contains("select") && status.contains("filter"), "hints still shown: {status:?}");
+        assert!(status.contains("⚠ listing containers"), "{status:?}");
+        assert!(status.trim_end().ends_with('…'), "{status:?}");
+        // The pane wraps the message instead of cutting it.
+        assert!(row_text(&buf, 2).contains("very long"), "{}", screen(&buf));
+    }
+}

@@ -1,0 +1,16 @@
+# Fixture for integration tests and manual e2e runs against a disposable daemon:
+#   DOCKER_HOST=tcp://127.0.0.1:23750 docker compose -f tests/fixtures/demo/compose.yml up -d
+name: demo
+services:
+  web:
+    image: nginx:alpine
+    ports: ["8080:80"]
+    environment: [GREETING=hello]
+  worker:
+    image: alpine:3.20
+    command: sh -c 'i=0; while true; do i=$$((i+1)); printf "\033[32mtick\033[0m %s\n" $$i; sleep 1; done'
+  db:
+    image: redis:7-alpine
+    volumes: [dbdata:/data]
+volumes:
+  dbdata:

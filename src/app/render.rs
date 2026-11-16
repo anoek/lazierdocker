@@ -139,12 +139,10 @@ impl App {
                 Some(e) => format!("Cannot reach docker: {e}"),
                 None => "Connecting to docker…".to_string(),
             };
-            buf.set_line(
-                inner.x + 1,
-                inner.y,
-                &Line::from(Span::styled(msg, Style::default().fg(t.subtext0))),
-                inner.width.saturating_sub(1),
-            );
+            let width = inner.width.saturating_sub(2).max(1) as usize;
+            for (i, line) in super::overlay::wrap(&msg, width).iter().take(inner.height as usize).enumerate() {
+                buf.set_stringn(inner.x + 1, inner.y + i as u16, line, width, Style::default().fg(t.subtext0));
+            }
             return;
         }
         let mut content_area = inner;

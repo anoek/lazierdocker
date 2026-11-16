@@ -838,3 +838,86 @@ mod select {
         assert_eq!(fx, vec![Effect::Copy("terminal\nworld".into())]);
     }
 }
+
+mod modes {
+    use super::*;
+    use ratatui::text::Line;
+
+    fn prefix(app: &mut App, c: char) {
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char(c)));
+    }
+
+    fn doc_app(lines: Vec<&str>) -> App {
+        let mut app = loaded_app();
+        let rows = app.rows().to_vec();
+        app.sidebar.select(&rows, &NodeKey::Section(crate::ui::sidebar::Section::Volumes));
+        app.sync_panes();
+        let pane = app.layout.focus;
+        app.panes.get_mut(&pane).unwrap().content =
+            Content::Doc(crate::doc::DocSurface::new(lines.into_iter().map(|l| Line::raw(l.to_string())).collect()));
+        draw(&mut app, 100, 20);
+        app.focus = Focus::Panes;
+        app
+    }
+
+    #[test]
+    fn copy_mode_yank_line() {
+        let mut app = doc_app(vec!["first line", "second line", "third"]);
+        prefix(&mut app, '[');
+        assert_eq!(app.mode, Mode::Copy);
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('V')));
+        app.handle_key(key(KeyCode::Char('j')));
+        let s = screen(&draw(&mut app, 100, 20));
+        assert!(s.contains(" COPY "), "{s}");
+        let fx = app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(fx, vec![Effect::Copy("second line\nthird".into())]);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn copy_mode_charwise_with_word_motion() {
+        let mut app = doc_app(vec!["alpha beta gamma"]);
+        prefix(&mut app, '[');
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('w')));
+        app.handle_key(key(KeyCode::Char('v')));
+        app.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Effect::Copy("beta".into())]);
+    }
+
+    #[test]
+    fn copy_mode_scrolls_to_cursor_and_esc_exits() {
+        let lines: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+        let mut app = doc_app(lines.iter().map(|s| s.as_str()).collect());
+        let pane = app.layout.focus;
+        prefix(&mut app, '[');
+        app.handle_key(key(KeyCode::Char('G')));
+        let Content::Doc(d) = &app.panes[&pane].content else { panic!() };
+        assert!(d.scroll > 50, "{}", d.scroll);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn resize_mode_adjusts_ratio() {
+        let mut app = loaded_app();
+        let rows = app.rows().to_vec();
+        let id = app.snap.containers.iter().find(|c| c.name == "loner").unwrap().id.clone();
+        app.sidebar.select(&rows, &NodeKey::Container(id));
+        draw(&mut app, 120, 30);
+        prefix(&mut app, 'v');
+        draw(&mut app, 120, 30);
+        let before = app.hits.splits[0].pos;
+        prefix(&mut app, 'r');
+        assert_eq!(app.mode, Mode::Resize);
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        draw(&mut app, 120, 30);
+        assert!(app.hits.splits[0].pos < before, "{} !< {before}", app.hits.splits[0].pos);
+    }
+}

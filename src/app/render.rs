@@ -187,6 +187,18 @@ impl App {
         }
         hits.content.push((id, content_area));
         self.paint_selection(buf, id, content_area);
+        self.paint_copy_cursor(buf, id, content_area);
+    }
+
+    fn paint_copy_cursor(&self, buf: &mut Buffer, id: PaneId, area: Rect) {
+        let Some(c) = self.copy.filter(|c| c.pane == id) else { return };
+        let top = self.content_top(id);
+        if c.pos.0 < top || c.pos.0 >= top + area.height as usize || c.pos.1 >= area.width as usize {
+            return;
+        }
+        let t = self.theme;
+        let cell = &mut buf[(area.x + c.pos.1 as u16, area.y + (c.pos.0 - top) as u16)];
+        cell.set_style(Style::default().bg(t.accent).fg(t.panel_bg).add_modifier(Modifier::BOLD));
     }
 
     fn paint_selection(&self, buf: &mut Buffer, id: PaneId, area: Rect) {
@@ -220,6 +232,19 @@ impl App {
                 ],
             ),
             Mode::Filter => (Some(("FILTER", t.mauve)), &[("enter", "keep"), ("esc", "clear")]),
+            Mode::Resize => (Some(("RESIZE", t.mauve)), &[("h/l", "width"), ("j/k", "height"), ("esc", "done")]),
+            Mode::Copy => (
+                Some(("COPY", t.yellow)),
+                &[
+                    ("hjkl", "move"),
+                    ("w/b/e", "word"),
+                    ("0/$", "line"),
+                    ("g/G", "top/bottom"),
+                    ("v/V", "select"),
+                    ("y", "copy"),
+                    ("q", "exit"),
+                ],
+            ),
             Mode::Normal => match self.focus {
                 Focus::Sidebar => (
                     None,

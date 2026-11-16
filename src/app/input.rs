@@ -62,13 +62,17 @@ impl App {
         if self.overlay.is_some() {
             return self.overlay_key(k);
         }
-        self.selection = None;
+        if self.mode != Mode::Copy {
+            self.selection = None;
+        }
         match self.mode {
             Mode::Prefix => {
                 self.mode = Mode::Normal;
                 return self.prefix_command(k);
             }
             Mode::Filter => return self.filter_key(k),
+            Mode::Resize => return self.resize_mode_key(k),
+            Mode::Copy => return self.copy_mode_key(k),
             Mode::Normal => {}
         }
         if is_prefix(&k) {
@@ -104,6 +108,11 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.focus_dir(area, Dir4::Down),
             KeyCode::Char('z') => self.layout.toggle_zoom(),
             KeyCode::Char('?') => return self.perform(super::actions::Action::Help),
+            KeyCode::Char('r') => self.mode = Mode::Resize,
+            KeyCode::Char('[') => {
+                self.focus = Focus::Panes;
+                self.enter_copy_mode();
+            }
             KeyCode::Char('v') | KeyCode::Char('%') => self.split_focused(SplitDir::Horizontal),
             KeyCode::Char('-') | KeyCode::Char('"') => self.split_focused(SplitDir::Vertical),
             KeyCode::Char('x') => self.close_pane(self.layout.focus),

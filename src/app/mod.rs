@@ -5,6 +5,7 @@
 //! as [`AppEvent`]s.
 
 pub mod actions;
+pub mod copy_mode;
 pub mod docker_actions;
 pub mod input;
 pub mod inspect;
@@ -42,6 +43,10 @@ pub enum Mode {
     Prefix,
     /// Editing the sidebar filter.
     Filter,
+    /// Resizing the focused pane with the keyboard.
+    Resize,
+    /// Keyboard selection in the focused pane.
+    Copy,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,6 +192,7 @@ pub struct App {
     pub toast: Option<(String, Instant)>,
     pub overlay: Option<overlay::Overlay>,
     pub selection: Option<selection::Selection>,
+    pub copy: Option<copy_mode::CopyCursor>,
     /// Running docker operations (status bar).
     pub pending_ops: Vec<String>,
     /// Compose files given on the command line (local project).
@@ -228,6 +234,7 @@ impl App {
             toast: None,
             overlay: None,
             selection: None,
+            copy: None,
             pending_ops: Vec::new(),
             compose_files: Vec::new(),
             overlay_hits: overlay::OverlayHits::default(),

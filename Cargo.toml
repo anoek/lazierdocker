@@ -6,10 +6,13 @@ description = "A mouse-first terminal UI for Docker"
 license = "MIT"
 
 [workspace]
-members = ["crates/ghostty-vt"]
+exclude = ["crates/ghostty-vt"]
 
 [dependencies]
+crossterm = { version = "0.29", features = ["event-stream"] }
 ghostty-vt = { path = "crates/ghostty-vt" }
+ratatui = "0.30"
+unicode-width = "0.2"
 
 [profile.dev.package.ghostty-vt]
 opt-level = 1

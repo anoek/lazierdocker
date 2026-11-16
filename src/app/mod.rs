@@ -7,6 +7,7 @@
 pub mod actions;
 pub mod copy_mode;
 pub mod docker_actions;
+pub mod find;
 pub mod input;
 pub mod inspect;
 pub mod loader;
@@ -47,6 +48,8 @@ pub enum Mode {
     Resize,
     /// Keyboard selection in the focused pane.
     Copy,
+    /// Typing a find query for the focused logs pane.
+    Find,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,11 +91,13 @@ pub enum Effect {
         key: inspect::ContentKey,
         spec: inspect::LoadSpec,
     },
-    /// Stream a container's logs into the pane (bollard, follow).
+    /// Stream a container's logs into the pane (bollard, follow); `full`
+    /// streams the whole history instead of the last lines.
     StartLogs {
         pane: PaneId,
         key: inspect::ContentKey,
         container_id: String,
+        full: bool,
     },
     /// Run a command in a PTY inside the pane. `key` is set for inspector
     /// content (installed only if still current); None for terminal panes.
@@ -138,6 +143,14 @@ pub struct Pane {
     pub inflight: bool,
     /// Tick of the last Load (periodic refresh of Top).
     pub refreshed_at: u64,
+    /// The log stream for `loaded` ended cleanly at this snapshot generation;
+    /// it resumes once a newer snapshot shows the container running.
+    pub logs_ended_at: Option<u64>,
+    /// Logs show the whole history instead of the last lines (until the
+    /// pane shows something else).
+    pub full_logs: bool,
+    /// Restart the content on the next sync even though `loaded` is current.
+    pub reload: bool,
 }
 
 impl Pane {
@@ -150,6 +163,9 @@ impl Pane {
             task: None,
             inflight: false,
             refreshed_at: 0,
+            logs_ended_at: None,
+            full_logs: false,
+            reload: false,
         }
     }
 
@@ -208,6 +224,10 @@ pub struct App {
     pub deferred: Option<overlay::Overlay>,
     pub selection: Option<selection::Selection>,
     pub copy: Option<copy_mode::CopyCursor>,
+    /// Find in a logs pane, and the last query confirmed (enter on an empty
+    /// prompt repeats it).
+    pub find: Option<find::Find>,
+    pub last_find: String,
     /// Running docker operations (status bar).
     pub pending_ops: Vec<String>,
     /// Compose files given on the command line (local project).
@@ -251,6 +271,8 @@ impl App {
             deferred: None,
             selection: None,
             copy: None,
+            find: None,
+            last_find: String::new(),
             pending_ops: Vec::new(),
             compose_files: Vec::new(),
             overlay_hits: overlay::OverlayHits::default(),
@@ -370,7 +392,10 @@ impl App {
 
     pub fn handle_app_event(&mut self, ev: AppEvent) -> Vec<Effect> {
         match ev {
-            AppEvent::TermActivity(_) => self.dirty = true,
+            AppEvent::TermActivity(pane) => {
+                self.find_output(pane);
+                self.dirty = true;
+            }
             AppEvent::TermExited(pane, sid, code) => {
                 if let Some(Pane { content: Content::Term(t), kind, .. }) =
                     self.panes.get_mut(&pane).filter(|p| matches!(&p.content, Content::Term(t) if t.id() == sid))
@@ -384,12 +409,15 @@ impl App {
                     self.dirty = true;
                 }
             }
-            AppEvent::LogsEnded(pane, key) => {
-                if let Some(Pane { content: Content::Term(t), loaded: Some(k), .. }) = self.panes.get_mut(&pane) {
-                    if *k == key {
+            AppEvent::LogsEnded { pane, key, clean } => {
+                if let Some(p) = self.panes.get_mut(&pane).filter(|p| p.loaded.as_ref() == Some(&key)) {
+                    if let Content::Term(t) = &mut p.content {
                         t.notice("[log stream ended]");
-                        self.dirty = true;
                     }
+                    if clean {
+                        p.logs_ended_at = Some(self.snap_generation);
+                    }
+                    self.dirty = true;
                 }
             }
             AppEvent::OpDone { op, desc, result } => {

@@ -6,6 +6,7 @@
 //! channel and wake the app, and the surface parses whatever is queued before
 //! it is drawn or queried.
 
+pub mod find;
 pub mod keys;
 pub mod render;
 
@@ -414,6 +415,42 @@ impl TermSurface {
         read_text(&self.core().term, at(start), at(end))
     }
 
+    /// Every match of `query` in the scrollback and screen, top to bottom.
+    pub fn find(&self, query: &str) -> Vec<find::Match> {
+        let c = self.core();
+        let total = c.term.scrollbar().map(|s| s.total as usize).unwrap_or(0);
+        let cols = c.term.cols().unwrap_or(1).max(1);
+        let rows: Vec<(String, bool)> = (0..total)
+            .map(|y| {
+                let at = |x: u16| Point::Screen(PointCoordinate { x, y: y as u32 });
+                let wrapped = c
+                    .term
+                    .grid_ref(at(0))
+                    .ok()
+                    .and_then(|g| g.row().ok())
+                    .and_then(|r| r.is_wrapped().ok())
+                    .unwrap_or(false);
+                (read_text(&c.term, at(0), at(cols - 1)), wrapped)
+            })
+            .collect();
+        find::find_in_rows(&rows, cols as usize, query)
+    }
+
+    /// Scroll so `row` (screen-absolute) is visible, centred if it was not.
+    pub fn reveal_row(&mut self, row: usize) {
+        let (_, top, len) = self.scrollbar();
+        if row >= top && row < top + len {
+            return;
+        }
+        self.core().term.scroll_viewport(ScrollViewport::Row(row.saturating_sub(len / 2)));
+    }
+
+    /// The viewport shows the newest output (new output scrolls it).
+    pub fn at_bottom(&self) -> bool {
+        let (total, top, len) = self.scrollbar();
+        top + len >= total
+    }
+
     /// Plain text of the visible viewport rows (tests and word selection).
     pub fn viewport_text(&self) -> Vec<String> {
         let c = self.core();
@@ -622,5 +659,26 @@ mod tests {
         assert_eq!(t.viewport_top(), offset - 2);
         let top = t.viewport_top();
         assert_eq!(t.text_between((top, 0), (top + 1, 9)), "line6\nline7");
+    }
+
+    #[test]
+    fn find_searches_scrollback_and_soft_wraps() {
+        let mut t = TermSurface::stream(10, 3, nop_wake()).unwrap();
+        let f = t.feeder(true);
+        f.feed(b"needle one\n");
+        for i in 0..10 {
+            f.feed(format!("line{i}\n").as_bytes());
+        }
+        // 14 chars in a 10-column terminal: "needle" wraps across rows.
+        f.feed(b"abcdefneedle x\n");
+        let m = t.find("needle");
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert_eq!(m[0].start, (0, 0));
+        assert_eq!((m[1].start.1, m[1].end.0 - m[1].start.0, m[1].end.1), (6, 1, 1));
+        // Revealing an off-screen match scrolls to it.
+        assert!(t.at_bottom());
+        t.reveal_row(0);
+        assert_eq!(t.viewport_top(), 0);
+        assert!(!t.at_bottom());
     }
 }

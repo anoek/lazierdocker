@@ -9,6 +9,8 @@ use crate::ui::theme::Theme;
 
 pub struct Status<'a> {
     pub pill: Option<(&'a str, ratatui::style::Color)>,
+    /// Text being typed or a search summary, shown after the pill.
+    pub prompt: Option<String>,
     pub hints: &'a [(&'a str, &'a str)],
     pub right: Option<(String, bool /*error*/)>,
 }
@@ -27,6 +29,10 @@ pub fn render(buf: &mut Buffer, area: Rect, s: &Status<'_>, t: &Theme) {
         spans.push(Span::raw(" "));
     } else {
         spans.push(Span::raw(" "));
+    }
+    if let Some(p) = &s.prompt {
+        spans.push(Span::styled(p.clone(), Style::default().fg(t.text).add_modifier(Modifier::BOLD)));
+        spans.push(Span::raw("   "));
     }
     for (i, (key, desc)) in s.hints.iter().enumerate() {
         if i > 0 {

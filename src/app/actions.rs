@@ -20,6 +20,8 @@ pub enum Action {
     ZoomPane(PaneId),
     /// Turn a pinned pane back into a follow-the-selection inspector.
     Unpin(PaneId),
+    /// Reload a logs pane with the whole history.
+    FullLogs(PaneId),
     Copy(String),
     Help,
     Docker(crate::docker::ops::DockerOp),
@@ -86,6 +88,10 @@ impl App {
                     p.kind = PaneKind::Inspector;
                     p.loaded = None;
                 }
+                Vec::new()
+            }
+            Action::FullLogs(id) => {
+                self.load_full_logs(id);
                 Vec::new()
             }
             Action::Copy(text) => vec![Effect::Copy(text)],
@@ -164,6 +170,9 @@ impl App {
             MenuItem::new("Split right", Action::SplitPane(id, SplitDir::Horizontal)).key("^b v"),
             MenuItem::new("Split down", Action::SplitPane(id, SplitDir::Vertical)).key("^b -"),
         ];
+        if self.shows_logs(id) && !self.panes.get(&id).is_some_and(|p| p.full_logs) {
+            items.push(MenuItem::new("Load full log history", Action::FullLogs(id)).key("f"));
+        }
         if self.layout.panes().len() > 1 {
             let label = if self.layout.zoomed { "Unzoom" } else { "Zoom" };
             items.push(MenuItem::new(label, Action::ZoomPane(id)).key("^b z"));

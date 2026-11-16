@@ -195,7 +195,7 @@ impl Runtime {
                     let _ = tx.send(AppEvent::Doc { pane, key, lines });
                 });
             }
-            Effect::StartLogs { pane, key, container_id } => {
+            Effect::StartLogs { pane, key, container_id, full } => {
                 let (cols, rows) = app.content_size(pane);
                 let surface = match TermSurface::stream(cols, rows, self.wake_for(pane)) {
                     Ok(s) => s,
@@ -216,8 +216,8 @@ impl Runtime {
                 let docker = self.docker.clone();
                 let tx = self.tx.clone();
                 let handle = tokio::spawn(async move {
-                    stream_logs(&docker, &container_id, &raw, &lf).await;
-                    let _ = tx.send(AppEvent::LogsEnded(pane, key));
+                    let clean = stream_logs(&docker, &container_id, full, &raw, &lf).await;
+                    let _ = tx.send(AppEvent::LogsEnded { pane, key, clean });
                 });
                 if let Some(p) = app.panes.get_mut(&pane) {
                     p.task = Some(handle.abort_handle());
@@ -267,22 +267,21 @@ impl Runtime {
     }
 }
 
-/// Follow a container's logs (lazydocker: since 60m, stdout+stderr).
-async fn stream_logs(docker: &Docker, id: &str, raw: &Feeder, lf: &Feeder) {
+/// Lines of history shown when a container's logs open.
+const LOG_TAIL_LINES: usize = 1000;
+
+/// Follow a container's logs (last `LOG_TAIL_LINES` lines, or everything
+/// when `full`; stdout+stderr). Returns false if the stream ended with an error.
+async fn stream_logs(docker: &Docker, id: &str, full: bool, raw: &Feeder, lf: &Feeder) -> bool {
     use bollard::container::LogOutput;
     let tty =
         docker.api.inspect_container(id, None).await.ok().and_then(|i| i.config.and_then(|c| c.tty)).unwrap_or(false);
     let feeder = if tty { raw } else { lf };
-    let since = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().saturating_sub(3600) as i32)
-        .unwrap_or(0);
     let opts = bollard::query_parameters::LogsOptions {
         follow: true,
         stdout: true,
         stderr: true,
-        since,
-        tail: "all".into(),
+        tail: if full { "all".into() } else { LOG_TAIL_LINES.to_string() },
         ..Default::default()
     };
     let mut stream = docker.api.logs(id, Some(opts));
@@ -294,8 +293,9 @@ async fn stream_logs(docker: &Docker, id: &str, raw: &Feeder, lf: &Feeder) {
             Ok(LogOutput::StdIn { .. }) => {}
             Err(e) => {
                 feeder.feed(format!("\r\n\x1b[31m{e}\x1b[0m\r\n").as_bytes());
-                break;
+                return false;
             }
         }
     }
+    true
 }

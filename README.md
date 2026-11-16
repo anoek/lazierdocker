@@ -74,6 +74,11 @@ clipboard. Shells, `docker attach` and logs run in embedded terminals powered by
 | sidebar, pane | `[` `]` | previous / next tab |
 | pane | `j k` `PgUp PgDn` `g G` | scroll (`G` re-enables follow) |
 | pane | `h l` `← →` / shift+wheel | scroll long lines sideways (`›` marks cut-off lines) |
+| pane | `f` | logs: load the full history (logs open with the last 1000 lines; projects 300) |
+| pane | `/` `ctrl+f` | logs: find (smart case); `enter` keeps the matches, `esc` clears |
+| pane | `n` `N` | logs: older / newer match; repeats the last search after `esc` |
+| pane | `ctrl+g` `F3` `ctrl+r` `ctrl+p` | logs: older match, also while typing (as is `↑`) |
+| pane | `ctrl+shift+g` `shift+F3` `ctrl+s` `ctrl+n` | logs: newer match, also while typing (as is `↓`) |
 | containers | `s` `r` `S` `p` `d` | stop, restart, start, pause, remove… |
 | containers | `E` `a` `m` `w` `b` | exec, attach, logs pane, browser, bulk… |
 | services | `u` `R` `U` `D` | up, restart menu, up project, down… |

@@ -27,6 +27,7 @@ impl App {
     }
 
     pub fn render_buf(&mut self, buf: &mut Buffer, area: Rect) {
+        self.refresh_find();
         self.size = (area.width, area.height);
         self.cursor = None;
         let mut hits = Hits::default();
@@ -184,6 +185,7 @@ impl App {
             }
         }
         hits.content.push((id, content_area));
+        self.paint_find(buf, id, content_area);
         self.paint_selection(buf, id, content_area);
         self.paint_copy_cursor(buf, id, content_area);
     }
@@ -202,6 +204,32 @@ impl App {
         let t = self.theme;
         let cell = &mut buf[(area.x + (c.pos.1 - left) as u16, area.y + (c.pos.0 - top) as u16)];
         cell.set_style(Style::default().bg(t.accent).fg(t.panel_bg).add_modifier(Modifier::BOLD));
+    }
+
+    fn paint_find(&self, buf: &mut Buffer, id: PaneId, area: Rect) {
+        let Some(f) = self.find.as_ref().filter(|f| f.pane == id) else { return };
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let t = self.theme;
+        let top = self.content_top(id);
+        let bottom = top + area.height as usize;
+        let other = Style::default().bg(t.surface1).fg(t.yellow);
+        let current = Style::default().bg(t.yellow).fg(t.panel_bg).add_modifier(Modifier::BOLD);
+        let first = f.matches.partition_point(|m| m.end.0 < top);
+        for (i, m) in f.matches.iter().enumerate().skip(first) {
+            if m.start.0 >= bottom {
+                break;
+            }
+            let style = if f.current == Some(i) { current } else { other };
+            for row in m.start.0.max(top)..=m.end.0.min(bottom - 1) {
+                let from = if row == m.start.0 { m.start.1 } else { 0 };
+                let to = if row == m.end.0 { m.end.1 } else { area.width as usize - 1 };
+                for col in from..=to.min(area.width as usize - 1) {
+                    buf[(area.x + col as u16, area.y + (row - top) as u16)].set_style(style);
+                }
+            }
+        }
     }
 
     fn paint_selection(&self, buf: &mut Buffer, id: PaneId, area: Rect) {
@@ -236,6 +264,7 @@ impl App {
                 ],
             ),
             Mode::Filter => (Some(("FILTER", t.mauve)), &[("enter", "keep"), ("esc", "clear")]),
+            Mode::Find => (Some(("FIND", t.yellow)), &[("enter", "keep"), ("↑↓", "older/newer"), ("esc", "clear")]),
             Mode::Resize => (Some(("RESIZE", t.mauve)), &[("h/l", "width"), ("j/k", "height"), ("esc", "done")]),
             Mode::Copy => (
                 Some(("COPY", t.yellow)),
@@ -273,6 +302,10 @@ impl App {
                         &[("^b", "window"), ("^b x", "close"), ("^b h", "← focus"), ("^b z", "zoom")],
                     )
                 }
+                Focus::Panes if self.find_active_here() => (
+                    Some(("FIND", t.yellow)),
+                    &[("n ^g", "older"), ("N", "newer"), ("/", "new search"), ("esc", "clear")],
+                ),
                 Focus::Panes => (
                     None,
                     &[
@@ -300,6 +333,7 @@ impl App {
             (Some(e), None) => Some((format!("⚠ {e}"), true)),
             (None, None) => Some((self.host.clone(), false)),
         };
-        statusbar::render(buf, area, &Status { pill, hints, right }, &t);
+        let prompt = self.find_status();
+        statusbar::render(buf, area, &Status { pill, prompt, hints, right }, &t);
     }
 }

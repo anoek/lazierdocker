@@ -36,10 +36,12 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: String) -> Vec<Effect> {
-        if self.overlay.is_some() || !matches!(self.mode, Mode::Normal | Mode::Filter) {
+        if self.overlay.is_some() || !matches!(self.mode, Mode::Normal | Mode::Filter | Mode::Find) {
             return Vec::new();
         }
-        if self.mode == Mode::Filter {
+        if self.mode == Mode::Find {
+            self.find_type(text.lines().next().unwrap_or(""));
+        } else if self.mode == Mode::Filter {
             self.sidebar.filter.push_str(text.lines().next().unwrap_or(""));
             self.rebuild_rows();
         } else if let Some(t) = self.focused_live_terminal() {
@@ -85,6 +87,7 @@ impl App {
             Mode::Filter => return self.filter_key(k),
             Mode::Resize => return self.resize_mode_key(k),
             Mode::Copy => return self.copy_mode_key(k),
+            Mode::Find => return self.find_key(k),
             Mode::Normal => {}
         }
         if is_prefix(&k) {
@@ -269,7 +272,21 @@ impl App {
             self.close_pane(id);
             return Vec::new();
         }
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let step = super::find::motion(&k).or(match k.code {
+            KeyCode::Char('n') if !ctrl => Some(super::find::Step::Older),
+            KeyCode::Char('N') if !ctrl => Some(super::find::Step::Newer),
+            _ => None,
+        });
+        if let Some(step) = step {
+            if self.find_step_or_repeat(step) {
+                return Vec::new();
+            }
+        }
         match k.code {
+            KeyCode::Char('/') => self.open_find(),
+            KeyCode::Char('f') if ctrl => self.open_find(),
+            KeyCode::Esc if self.find_active_here() => self.close_find(),
             KeyCode::Char('q') => return vec![Effect::Quit],
             KeyCode::Esc | KeyCode::BackTab | KeyCode::Tab => {
                 if self.sidebar_visible {
@@ -288,6 +305,7 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.hscroll_pane(id, 8),
             KeyCode::Home | KeyCode::Char('g') => self.scroll_pane_top(id),
             KeyCode::End | KeyCode::Char('G') => self.scroll_pane_end(id),
+            KeyCode::Char('f') => self.load_full_logs(id),
             KeyCode::Char(c) => {
                 if let Some(target) = self.pane_target(id) {
                     return self.item_key(c, &target);
@@ -405,8 +423,8 @@ impl App {
         double
     }
 
-    /// A mouse press ends keyboard modes: the filter is committed, resize,
-    /// copy and prefix modes are left (so the next keys go where the user clicked).
+    /// A mouse press ends keyboard modes: the filter and find query are
+    /// committed, resize, copy and prefix modes are left (so the next keys go where the user clicked).
     fn end_keyboard_mode(&mut self) {
         match self.mode {
             Mode::Normal => {}
@@ -415,7 +433,8 @@ impl App {
                 self.selection = None;
                 self.mode = Mode::Normal;
             }
-            Mode::Filter | Mode::Resize | Mode::Prefix => self.mode = Mode::Normal,
+            Mode::Find if self.find.as_ref().is_none_or(|f| f.query.is_empty()) => self.close_find(),
+            Mode::Filter | Mode::Resize | Mode::Prefix | Mode::Find => self.mode = Mode::Normal,
         }
     }
 

@@ -232,6 +232,7 @@ mod inspector {
 
 mod streams {
     use super::*;
+    use crate::app::actions::Action;
     use crate::app::inspect::{stats_lines, LoadSpec, Tab};
     use crate::docker::stats::{StatsHistory, StatsSample};
 
@@ -267,6 +268,105 @@ mod streams {
         snap.containers.iter_mut().find(|c| c.id == id).unwrap().state = ContainerState::Exited;
         app.handle_app_event(AppEvent::Snapshot(Box::new(snap)));
         assert!(matches!(&app.sync_panes()[..], [Effect::StartLogs { .. }]));
+    }
+
+    /// Start a logs stream for `loner`; returns (pane, key).
+    fn start_loner_logs(app: &mut App) -> (PaneId, inspect::ContentKey) {
+        let id = loner(app);
+        select(app, NodeKey::Container(id));
+        app.set_tab(app.layout.focus, Tab::Logs);
+        let fx = app.sync_panes();
+        let [Effect::StartLogs { pane, key, .. }] = &fx[..] else { panic!("{fx:?}") };
+        (*pane, key.clone())
+    }
+
+    #[test]
+    fn logs_resume_after_restart_missed_by_snapshots() {
+        // `docker restart` is fast: snapshots may only ever see "running",
+        // so the content key never changes. The ended stream must resume.
+        let mut app = loaded_app();
+        let (pane, key) = start_loner_logs(&mut app);
+        app.handle_app_event(AppEvent::LogsEnded { pane, key, clean: true });
+        assert!(app.sync_panes().is_empty(), "wait for a snapshot taken after the stream ended");
+        app.handle_app_event(AppEvent::Snapshot(Box::new(demo_snapshot())));
+        assert!(matches!(&app.sync_panes()[..], [Effect::StartLogs { .. }]));
+        assert!(app.sync_panes().is_empty(), "resume once");
+    }
+
+    #[test]
+    fn logs_stay_ended_while_container_stopped() {
+        let mut app = loaded_app();
+        let id = loner(&app);
+        start_loner_logs(&mut app);
+        let mut snap = demo_snapshot();
+        snap.containers.iter_mut().find(|c| c.id == id).unwrap().state = ContainerState::Exited;
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snap.clone())));
+        let fx = app.sync_panes();
+        let [Effect::StartLogs { pane, key, .. }] = &fx[..] else { panic!("{fx:?}") };
+        app.handle_app_event(AppEvent::LogsEnded { pane: *pane, key: key.clone(), clean: true });
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snap)));
+        assert!(app.sync_panes().is_empty());
+    }
+
+    #[test]
+    fn logs_do_not_resume_after_stream_error() {
+        let mut app = loaded_app();
+        let (pane, key) = start_loner_logs(&mut app);
+        app.handle_app_event(AppEvent::LogsEnded { pane, key, clean: false });
+        app.handle_app_event(AppEvent::Snapshot(Box::new(demo_snapshot())));
+        assert!(app.sync_panes().is_empty());
+    }
+
+    fn starts_full(fx: &[Effect]) -> Option<bool> {
+        match fx {
+            [Effect::StartLogs { full, .. }] => Some(*full),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn f_reloads_logs_with_full_history_until_view_changes() {
+        let mut app = loaded_app();
+        let (pane, _) = start_loner_logs(&mut app);
+        assert!(app.pane_menu(pane).items.iter().any(|i| i.action == Action::FullLogs(pane)));
+        app.focus = Focus::Panes;
+        app.handle_key(key(KeyCode::Char('f')));
+        assert_eq!(starts_full(&app.sync_panes()), Some(true));
+        assert!(app.sync_panes().is_empty(), "reload once");
+        assert!(!app.pane_menu(pane).items.iter().any(|i| i.action == Action::FullLogs(pane)));
+        // Full history survives a restart resume...
+        let key = app.panes[&pane].loaded.clone().unwrap();
+        app.handle_app_event(AppEvent::LogsEnded { pane, key, clean: true });
+        app.handle_app_event(AppEvent::Snapshot(Box::new(demo_snapshot())));
+        assert_eq!(starts_full(&app.sync_panes()), Some(true));
+        // ...but not switching to another tab and back.
+        app.cycle_tab(pane, 1);
+        app.sync_panes();
+        app.cycle_tab(pane, -1);
+        assert_eq!(starts_full(&app.sync_panes()), Some(false));
+    }
+
+    #[test]
+    fn full_history_only_for_logs_tab() {
+        let mut app = loaded_app();
+        let (pane, _) = start_loner_logs(&mut app);
+        app.set_tab(pane, Tab::Env);
+        app.sync_panes();
+        assert!(!app.pane_menu(pane).items.iter().any(|i| i.action == Action::FullLogs(pane)));
+        app.perform(Action::FullLogs(pane));
+        assert!(app.sync_panes().is_empty());
+        assert!(app.toast.is_some());
+    }
+
+    #[test]
+    fn full_project_logs_tail_all() {
+        let mut app = loaded_app();
+        select(&mut app, NodeKey::Project("demo".into()));
+        app.sync_panes();
+        app.perform(Action::FullLogs(app.layout.focus));
+        let fx = app.sync_panes();
+        let [Effect::SpawnTerm { argv, .. }] = &fx[..] else { panic!("{fx:?}") };
+        assert!(argv.contains(&"--tail=all".to_string()), "{argv:?}");
     }
 
     #[test]
@@ -1136,5 +1236,226 @@ mod top_refresh {
         app.tick += 1;
         let fx = app.sync_panes();
         assert!(matches!(&fx[..], [Effect::Load { key: k, .. }] if *k == key), "{fx:?}");
+    }
+}
+
+mod find {
+    use super::*;
+    use crate::app::find::Step;
+    use crate::app::inspect::Tab;
+    use crate::term::TermSurface;
+    use std::sync::Arc;
+
+    /// A logs pane holding `n` lines; every tenth (3, 13, …) says ERROR.
+    fn logs_app(n: usize) -> (App, PaneId, crate::term::Feeder) {
+        let mut app = loaded_app();
+        let id = app.snap.containers.iter().find(|c| c.name == "loner").unwrap().id.clone();
+        let rows = app.rows().to_vec();
+        app.sidebar.select(&rows, &NodeKey::Container(id));
+        let pane = app.layout.focus;
+        app.set_tab(pane, Tab::Logs);
+        app.sync_panes();
+        let t = TermSurface::stream(80, 10, Arc::new(|| {})).unwrap();
+        let f = t.feeder(true);
+        for i in 0..n {
+            f.feed(format!("line {i} {}\n", if i % 10 == 3 { "ERROR boom" } else { "ok" }).as_bytes());
+        }
+        app.panes.get_mut(&pane).unwrap().content = Content::Term(t);
+        app.focus = Focus::Panes;
+        draw(&mut app, 100, 20);
+        (app, pane, f)
+    }
+
+    fn typ(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn current_line(app: &App) -> String {
+        let f = app.find.as_ref().unwrap();
+        let m = f.matches[f.current.unwrap()];
+        app.content_row_text(f.pane, m.start.0)
+    }
+
+    #[test]
+    fn slash_finds_nearest_match_and_n_steps_older() {
+        let (mut app, _, _) = logs_app(100);
+        app.handle_key(key(KeyCode::Char('/')));
+        assert_eq!(app.mode, Mode::Find);
+        typ(&mut app, "error");
+        assert_eq!(app.find.as_ref().unwrap().matches.len(), 10, "smart case matches ERROR");
+        assert_eq!(current_line(&app), "line 93 ERROR boom");
+        assert!(screen(&draw(&mut app, 100, 20)).contains("/error▏  10/10"));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Char('n')));
+        }
+        assert_eq!(current_line(&app), "line 43 ERROR boom");
+        // The view scrolled to show it.
+        let row = app.find.as_ref().map(|f| f.matches[f.current.unwrap()].start.0).unwrap();
+        let top = app.content_top(app.layout.focus);
+        assert!(row >= top && row < top + 10, "{row} {top}");
+        app.handle_key(key(KeyCode::Char('N')));
+        assert_eq!(current_line(&app), "line 53 ERROR boom");
+        assert!(screen(&draw(&mut app, 100, 20)).contains("/error  6/10"));
+    }
+
+    #[test]
+    fn stepping_wraps_with_a_notice() {
+        let (mut app, _, _) = logs_app(30);
+        app.open_find();
+        typ(&mut app, "boom");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('N')));
+        assert_eq!(current_line(&app), "line 3 ERROR boom");
+        assert!(app.toast.as_ref().is_some_and(|(m, _)| m.contains("wrapped to the top")));
+        app.step_find(Step::Older);
+        assert_eq!(current_line(&app), "line 23 ERROR boom");
+    }
+
+    #[test]
+    fn matches_are_highlighted() {
+        let (mut app, pane, _) = logs_app(20);
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::Find, "ctrl+f opens find");
+        typ(&mut app, "ok");
+        let buf = draw(&mut app, 100, 20);
+        let (_, area) = *app.hits.content.iter().find(|(p, _)| *p == pane).unwrap();
+        let f = app.find.as_ref().unwrap();
+        let top = app.content_top(pane);
+        let cell = |m: crate::term::find::Match| &buf[(area.x + m.start.1 as u16, area.y + (m.start.0 - top) as u16)];
+        let cur = f.matches[f.current.unwrap()];
+        let other = *f.matches.iter().rev().find(|m| m.start.0 >= top && **m != cur).unwrap();
+        assert_eq!(cell(cur).bg, app.theme.yellow);
+        assert_eq!(cell(cur).symbol(), "o");
+        assert_eq!(cell(other).bg, app.theme.surface1);
+    }
+
+    #[test]
+    fn esc_clears_and_enter_repeats_last_search() {
+        let (mut app, _, _) = logs_app(30);
+        app.open_find();
+        typ(&mut app, "boom");
+        app.handle_key(key(KeyCode::Enter));
+        // Esc clears the search before it would leave the pane.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.find.is_none());
+        assert_eq!(app.focus, Focus::Panes);
+        // Enter on an empty prompt repeats the last query.
+        app.open_find();
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.find.as_ref().map(|f| f.query.as_str()), Some("boom"));
+        // Esc while typing cancels.
+        app.open_find();
+        typ(&mut app, "zz");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.find.is_none() && app.mode == Mode::Normal);
+    }
+
+    #[test]
+    fn no_match_closes_with_notice() {
+        let (mut app, _, _) = logs_app(10);
+        app.open_find();
+        typ(&mut app, "nothing here");
+        assert!(screen(&draw(&mut app, 100, 20)).contains("no matches"));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.find.is_none());
+        assert!(app.toast.as_ref().is_some_and(|(m, _)| m == "not found: nothing here"));
+    }
+
+    #[test]
+    fn find_only_in_logs_and_closes_when_pane_changes() {
+        let (mut app, pane, _) = logs_app(10);
+        app.open_find();
+        typ(&mut app, "boom");
+        app.handle_key(key(KeyCode::Enter));
+        app.cycle_tab(pane, 1);
+        app.sync_panes();
+        draw(&mut app, 100, 20);
+        assert!(app.find.is_none(), "another tab drops the search");
+        app.handle_key(key(KeyCode::Char('/')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.toast.as_ref().is_some_and(|(m, _)| m.contains("logs panes")));
+    }
+
+    #[test]
+    fn new_output_updates_matches_and_keeps_current() {
+        let (mut app, pane, feeder) = logs_app(30);
+        app.open_find();
+        typ(&mut app, "boom");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(current_line(&app), "line 13 ERROR boom");
+        feeder.feed(b"later boom\n");
+        app.handle_app_event(AppEvent::TermActivity(pane));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        draw(&mut app, 100, 20);
+        assert_eq!(app.find.as_ref().unwrap().matches.len(), 4);
+        assert_eq!(current_line(&app), "line 13 ERROR boom");
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_g_and_other_motion_keys_step_matches() {
+        let (mut app, _, _) = logs_app(60);
+        app.open_find();
+        typ(&mut app, "boom");
+        assert_eq!(current_line(&app), "line 53 ERROR boom");
+        // While typing.
+        app.handle_key(ctrl('g'));
+        assert_eq!(current_line(&app), "line 43 ERROR boom");
+        assert_eq!(app.mode, Mode::Find, "stepping keeps the prompt open");
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        assert_eq!(current_line(&app), "line 53 ERROR boom");
+        app.handle_key(key(KeyCode::Enter));
+        // After enter.
+        let older: [KeyEvent; 4] = [ctrl('g'), key(KeyCode::F(3)), ctrl('r'), ctrl('p')];
+        for (i, k) in older.into_iter().enumerate() {
+            app.handle_key(k);
+            assert_eq!(current_line(&app), format!("line {} ERROR boom", 43 - 10 * i), "{k:?}");
+        }
+        let newer: [KeyEvent; 4] = [
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::F(3), KeyModifiers::SHIFT),
+            ctrl('s'),
+            ctrl('n'),
+        ];
+        for (i, k) in newer.into_iter().enumerate() {
+            app.handle_key(k);
+            assert_eq!(current_line(&app), format!("line {} ERROR boom", 23 + 10 * i), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn next_keys_repeat_the_last_search() {
+        let (mut app, _, _) = logs_app(30);
+        // Nothing to repeat yet: n does nothing.
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(app.find.is_none());
+        app.open_find();
+        typ(&mut app, "boom");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.find.is_none());
+        app.handle_key(ctrl('g'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(current_line(&app), "line 23 ERROR boom");
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('N')));
+        assert_eq!(app.find.as_ref().map(|f| f.matches.len()), Some(3));
+    }
+
+    #[test]
+    fn paste_goes_into_the_query() {
+        let (mut app, _, _) = logs_app(10);
+        app.open_find();
+        app.handle_event(crossterm::event::Event::Paste("ERROR b\nignored".into()));
+        assert_eq!(app.find.as_ref().unwrap().query, "ERROR b");
+        assert_eq!(app.find.as_ref().unwrap().matches.len(), 1);
     }
 }

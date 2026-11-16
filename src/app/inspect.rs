@@ -125,6 +125,25 @@ impl App {
         self.dirty = true;
     }
 
+    /// The pane shows a container, service or project's Logs tab.
+    pub fn shows_logs(&self, id: PaneId) -> bool {
+        self.pane_tab(id) == Some(Tab::Logs)
+            && matches!(self.pane_target(id), Some(NodeKey::Container(_) | NodeKey::Service(..) | NodeKey::Project(_)))
+    }
+
+    /// Reload a logs pane with the whole history instead of the last lines.
+    pub fn load_full_logs(&mut self, id: PaneId) {
+        if !self.shows_logs(id) {
+            self.flash("full history is only for the Logs tab");
+            return;
+        }
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.full_logs = true;
+            p.reload = true;
+            self.dirty = true;
+        }
+    }
+
     /// Container backing a target (containers and services).
     pub fn target_container(&self, key: &NodeKey) -> Option<&crate::docker::model::Container> {
         match key {
@@ -182,7 +201,15 @@ impl App {
                 continue;
             };
             let key = ContentKey { rev: self.content_rev(&target, tab), target: target.clone(), tab };
-            if self.panes.get(&id).and_then(|p| p.loaded.as_ref()) == Some(&key) {
+            // A restart can be too quick for any snapshot to see the container
+            // stop, leaving `key` unchanged; resume the ended stream instead.
+            let resume_logs = tab == Tab::Logs
+                && self.panes.get(&id).and_then(|p| p.logs_ended_at).is_some_and(|g| g < self.snap_generation)
+                && self
+                    .target_container(&target)
+                    .is_some_and(|c| c.state == crate::docker::model::ContainerState::Running);
+            let reload = resume_logs || self.panes.get(&id).is_some_and(|p| p.reload);
+            if !reload && self.panes.get(&id).and_then(|p| p.loaded.as_ref()) == Some(&key) {
                 // Top refreshes every second, one request at a time.
                 let tick = self.tick;
                 let due = self.panes.get(&id).is_some_and(|p| tab == Tab::Top && !p.inflight && p.refreshed_at < tick);
@@ -201,12 +228,19 @@ impl App {
                 .get(&id)
                 .and_then(|p| p.loaded.as_ref())
                 .is_some_and(|k| k.target == key.target && k.tab == key.tab);
+            if !same_view {
+                if let Some(p) = self.panes.get_mut(&id) {
+                    p.full_logs = false;
+                }
+            }
             let plan = self.plan_content(&target, tab, id);
             if !same_view && self.selection.is_some_and(|s| s.pane == id) {
                 self.selection = None;
             }
             let pane = self.panes.get_mut(&id).expect("pane exists");
             pane.loaded = Some(key.clone());
+            pane.logs_ended_at = None;
+            pane.reload = false;
             match plan {
                 Plan::Lines(lines) => {
                     if same_view {
@@ -232,7 +266,7 @@ impl App {
                 Plan::Logs { container_id } => {
                     pane.stop_task();
                     pane.content = Content::Doc(DocSurface::message("Loading…"));
-                    effects.push(Effect::StartLogs { pane: id, key, container_id });
+                    effects.push(Effect::StartLogs { pane: id, key, container_id, full: pane.full_logs });
                 }
                 Plan::Spawn { argv } => {
                     pane.stop_task();
@@ -275,12 +309,16 @@ impl App {
             (NodeKey::Image(id), _) => Plan::Load(LoadSpec::Image { id: id.clone() }),
             (NodeKey::Volume(name), _) => Plan::Load(LoadSpec::Volume { name: name.clone() }),
             (NodeKey::Network(id), _) => Plan::Load(LoadSpec::Network { id: id.clone() }),
-            (NodeKey::Project(p), Tab::Logs) => Plan::Spawn {
-                argv: ["docker", "compose", "-p", p, "logs", "--tail=300", "--follow"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-            },
+            (NodeKey::Project(p), Tab::Logs) => {
+                let full = self.panes.get(&pane).is_some_and(|p| p.full_logs);
+                let tail = if full { "--tail=all" } else { "--tail=300" };
+                Plan::Spawn {
+                    argv: ["docker", "compose", "-p", p, "logs", tail, "--follow"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                }
+            }
             (NodeKey::Project(p), _) => {
                 let project = self.snap.project(p);
                 let local = project.is_some_and(|p| p.local);

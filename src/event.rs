@@ -19,8 +19,8 @@ pub enum AppEvent {
     TermActivity(PaneId),
     /// A terminal surface's child process exited: (pane, surface id, code).
     TermExited(PaneId, u64, Option<u32>),
-    /// A container log stream ended.
-    LogsEnded(PaneId, ContentKey),
+    /// A container log stream ended; `clean` unless it ended with an error.
+    LogsEnded { pane: PaneId, key: ContentKey, clean: bool },
     /// A docker operation finished.
     OpDone { op: crate::docker::ops::DockerOp, desc: String, result: Result<Option<String>, String> },
     /// One stats sample for a container.

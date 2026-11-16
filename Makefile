@@ -6,7 +6,7 @@
 #   make install PREFIX=/usr/local   (may need sudo)
 #   make uninstall
 #
-# Building needs Rust and Zig 0.16 (for the vendored libghostty-vt).
+# Building needs Rust and Zig 0.15.2 (the libghostty-vt crate builds Ghostty's VT library).
 
 PREFIX  ?= $(HOME)/.local
 BINDIR  ?= $(PREFIX)/bin

@@ -1,20 +1,12 @@
 lazierdocker
 Copyright (c) 2026 Akita Noek. Licensed under the MIT License (see LICENSE).
 
-This project includes third-party code:
-
-crates/ghostty-vt/
-  Rust bindings to libghostty-vt, copied verbatim from herdr
-  (https://github.com/herdrdev/herdr, commit ee5bfb5).
-  Copyright (c) herdr contributors. Licensed under the Apache License 2.0;
-  see crates/ghostty-vt/LICENSE.
-
-vendor/libghostty-vt/
-  libghostty-vt from Ghostty (https://github.com/ghostty-org/ghostty), as vendored and
-  patched by herdr (see vendor/libghostty-vt.patches.md and vendor/libghostty-vt.vendor.json).
-  Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors. Licensed under the MIT
-  License; see vendor/libghostty-vt/LICENSE.
+Terminal emulation is provided by libghostty-vt from Ghostty
+(https://github.com/ghostty-org/ghostty, MIT, Copyright (c) 2024 Mitchell Hashimoto, Ghostty
+contributors), built and linked through the libghostty-vt crate
+(https://github.com/Uzaaft/libghostty-rs, MIT OR Apache-2.0). Neither is included in this
+repository; Cargo fetches them at build time.
 
 lazierdocker's feature set is modelled on lazydocker (https://github.com/jesseduffield/lazydocker,
-MIT) and its terminal interaction model on herdr; no source code from either project is
-included outside the directories listed above.
+MIT) and its terminal interaction model on herdr (https://github.com/herdrdev/herdr, Apache-2.0); no
+source code from either project is included.

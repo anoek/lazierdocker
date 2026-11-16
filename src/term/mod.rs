@@ -1,22 +1,43 @@
 //! Terminal surface backed by libghostty-vt: an embedded terminal emulator for
 //! `docker exec` shells, `docker attach`, attached compose commands and logs.
+//!
+//! libghostty-vt handles are `!Send`, so each terminal lives on the UI thread.
+//! The PTY pump thread and log feeders only move bytes: they send them over a
+//! channel and wake the app, and the surface parses whatever is queued before
+//! it is drawn or queried.
 
 pub mod keys;
 pub mod render;
 
+use std::cell::{RefCell, RefMut};
 use std::io::{Read, Write};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use crossterm::event::KeyEvent as CtKey;
-use ghostty_vt::{
-    ffi, ActiveScreen, KeyEncoder, MouseEncoder, MouseEvent, RenderState, RowCells, RowIterator, Terminal,
-};
+use libghostty_vt::fmt::Format;
+use libghostty_vt::key::Encoder as KeyEncoder;
+use libghostty_vt::render::{CellIterator, RowIterator};
+use libghostty_vt::screen::Screen;
+use libghostty_vt::selection::FormatOptions;
+use libghostty_vt::terminal::{Mode, Point, PointCoordinate, ScrollViewport};
+use libghostty_vt::{mouse, RenderState, Terminal, TerminalOptions};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
-/// Scrollback budget per terminal, in bytes.
+pub use libghostty_vt::key::Mods;
+pub use libghostty_vt::mouse::{Action as MouseAction, Button as MouseButton};
+
+/// `TERM` for children: every container image has xterm-256color's terminfo.
+pub const TERM: &str = "xterm-256color";
+/// Scrollback budget per terminal, in bytes. libghostty-vt's header calls
+/// `max_scrollback` a line count, but Ghostty passes it to the page list as a
+/// byte limit (`PageList.max_size`).
 pub const SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
+/// Most bytes parsed per drain, so a flooding child cannot stall a frame.
+const DRAIN_BUDGET: usize = 4 * 1024 * 1024;
 
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 /// Called with (surface id, exit code) when the child exits.
@@ -25,17 +46,17 @@ pub type OnExit = Arc<dyn Fn(u64, Option<u32>) + Send + Sync>;
 static NEXT_SURFACE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub(crate) struct Core {
-    pub term: Terminal,
-    pub rs: RenderState,
-    pub keys: KeyEncoder,
-    pub ri: RowIterator,
-    pub rc: RowCells,
+    pub term: Terminal<'static, 'static>,
+    pub rs: RenderState<'static>,
+    pub keys: KeyEncoder<'static>,
+    pub rows: RowIterator<'static>,
+    pub cells: CellIterator<'static>,
 }
 
 /// Feeds bytes into a terminal from another thread (logs streams).
 #[derive(Clone)]
 pub struct Feeder {
-    core: Arc<Mutex<Core>>,
+    tx: Sender<Vec<u8>>,
     pending: Arc<AtomicBool>,
     wake: Wake,
     /// Convert bare `\n` to `\r\n` (non-PTY streams).
@@ -44,16 +65,8 @@ pub struct Feeder {
 
 impl Feeder {
     pub fn feed(&self, bytes: &[u8]) {
-        {
-            let mut core = self.core.lock().expect("term core");
-            if self.lf_to_crlf {
-                core.term.write(&normalise_lf(bytes));
-            } else {
-                core.term.write(bytes);
-            }
-            let _ = core.term.take_bell_count();
-        }
-        if !self.pending.swap(true, Ordering::AcqRel) {
+        let bytes = if self.lf_to_crlf { normalise_lf(bytes) } else { bytes.to_vec() };
+        if self.tx.send(bytes).is_ok() && !self.pending.swap(true, Ordering::AcqRel) {
             (self.wake)();
         }
     }
@@ -74,11 +87,15 @@ pub fn normalise_lf(bytes: &[u8]) -> Vec<u8> {
 }
 
 pub struct TermSurface {
-    core: Arc<Mutex<Core>>,
+    core: RefCell<Core>,
+    /// Output waiting to be parsed (from the PTY pump or feeders).
+    rx: Receiver<Vec<u8>>,
+    tx: Sender<Vec<u8>>,
     /// Bytes for the child, written by a dedicated thread so a child that
     /// stops reading never blocks the UI.
-    writer: Option<std::sync::mpsc::Sender<Vec<u8>>>,
-    replies: Arc<Mutex<Vec<u8>>>,
+    writer: Option<Sender<Vec<u8>>>,
+    /// Query replies (DA, DSR, …) the terminal produced while parsing.
+    replies: Rc<RefCell<Vec<u8>>>,
     master: Option<Box<dyn MasterPty + Send>>,
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     exit: Arc<Mutex<Option<Option<u32>>>>,
@@ -94,29 +111,34 @@ impl std::fmt::Debug for TermSurface {
     }
 }
 
-fn new_core(cols: u16, rows: u16, replies: Arc<Mutex<Vec<u8>>>) -> Result<Core> {
+fn err(what: &str) -> impl FnOnce(libghostty_vt::Error) -> anyhow::Error + '_ {
+    move |e| anyhow::anyhow!("{what}: {e:?}")
+}
+
+fn new_core(cols: u16, rows: u16, replies: Rc<RefCell<Vec<u8>>>) -> Result<Core> {
     let mut term =
-        Terminal::new(cols.max(1), rows.max(1), SCROLLBACK_BYTES).map_err(|e| anyhow::anyhow!("terminal: {e:?}"))?;
-    term.set_write_pty_callback(move |b| replies.lock().expect("replies").extend_from_slice(b))
-        .map_err(|e| anyhow::anyhow!("callback: {e:?}"))?;
-    let mut keys = KeyEncoder::new().map_err(|e| anyhow::anyhow!("key encoder: {e:?}"))?;
-    keys.set_from_terminal(&term);
+        Terminal::new(TerminalOptions { cols: cols.max(1), rows: rows.max(1), max_scrollback: SCROLLBACK_BYTES })
+            .map_err(err("terminal"))?;
+    term.on_pty_write(move |_, b| replies.borrow_mut().extend_from_slice(b)).map_err(err("callback"))?;
     Ok(Core {
         term,
-        rs: RenderState::new().map_err(|e| anyhow::anyhow!("render state: {e:?}"))?,
-        keys,
-        ri: RowIterator::new().map_err(|e| anyhow::anyhow!("row iterator: {e:?}"))?,
-        rc: RowCells::new().map_err(|e| anyhow::anyhow!("row cells: {e:?}"))?,
+        rs: RenderState::new().map_err(err("render state"))?,
+        keys: KeyEncoder::new().map_err(err("key encoder"))?,
+        rows: RowIterator::new().map_err(err("row iterator"))?,
+        cells: CellIterator::new().map_err(err("cell iterator"))?,
     })
 }
 
 impl TermSurface {
     /// A terminal fed from a byte stream (no child process).
     pub fn stream(cols: u16, rows: u16, wake: Wake) -> Result<Self> {
-        let replies = Arc::new(Mutex::new(Vec::new()));
+        let replies = Rc::new(RefCell::new(Vec::new()));
         let core = new_core(cols, rows, replies.clone())?;
+        let (tx, rx) = std::sync::mpsc::channel();
         Ok(Self {
-            core: Arc::new(Mutex::new(core)),
+            core: RefCell::new(core),
+            rx,
+            tx,
             writer: None,
             replies,
             master: None,
@@ -145,7 +167,7 @@ impl TermSurface {
             .context("opening pty")?;
         let mut cmd = CommandBuilder::new(argv.first().context("empty command")?);
         cmd.args(&argv[1..]);
-        cmd.env("TERM", ghostty_vt::TERM);
+        cmd.env("TERM", TERM);
         cmd.env("COLORTERM", "truecolor");
         for k in ["TMUX", "TMUX_PANE", "KITTY_WINDOW_ID", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"] {
             cmd.env_remove(k);
@@ -170,14 +192,12 @@ impl TermSurface {
         })?;
         me.killer = Some(child.clone_killer());
         me.master = Some(pair.master);
-        me.writer = Some(writer.clone());
+        me.writer = Some(writer);
 
-        // Pump: child output → terminal; terminal replies → child.
+        // Pump: child output → the surface's queue.
         {
-            let core = me.core.clone();
-            let replies = me.replies.clone();
+            let tx = me.tx.clone();
             let pending = me.pending.clone();
-            let wake = wake.clone();
             std::thread::Builder::new().name("pty-pump".into()).spawn(move || {
                 let mut buf = [0u8; 16 * 1024];
                 loop {
@@ -185,15 +205,8 @@ impl TermSurface {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    {
-                        let mut c = core.lock().expect("term core");
-                        c.term.write(&buf[..n]);
-                        let _ = c.term.take_bell_count();
-                        let _ = c.term.take_pwd_changes();
-                    }
-                    let out = std::mem::take(&mut *replies.lock().expect("replies"));
-                    if !out.is_empty() {
-                        let _ = writer.send(out);
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
                     }
                     if !pending.swap(true, Ordering::AcqRel) {
                         wake();
@@ -215,7 +228,29 @@ impl TermSurface {
     }
 
     pub fn feeder(&self, lf_to_crlf: bool) -> Feeder {
-        Feeder { core: self.core.clone(), pending: self.pending.clone(), wake: self.wake.clone(), lf_to_crlf }
+        Feeder { tx: self.tx.clone(), pending: self.pending.clone(), wake: self.wake.clone(), lf_to_crlf }
+    }
+
+    /// The terminal, with all queued output parsed and its replies sent.
+    pub(crate) fn core(&self) -> RefMut<'_, Core> {
+        let mut core = self.core.borrow_mut();
+        let mut parsed = 0;
+        while parsed < DRAIN_BUDGET {
+            match self.rx.try_recv() {
+                Ok(bytes) => {
+                    core.term.vt_write(&bytes);
+                    parsed += bytes.len();
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        if parsed >= DRAIN_BUDGET {
+            // More is queued: come back for it next frame.
+            self.pending.store(true, Ordering::Release);
+            (self.wake)();
+        }
+        self.flush_replies();
+        core
     }
 
     /// Unique identity of this surface (distinguishes replaced content).
@@ -245,7 +280,7 @@ impl TermSurface {
     }
 
     fn flush_replies(&self) {
-        let out = std::mem::take(&mut *self.replies.lock().expect("replies"));
+        let out = std::mem::take(&mut *self.replies.borrow_mut());
         if !out.is_empty() {
             self.write_child(&out);
         }
@@ -257,10 +292,7 @@ impl TermSurface {
             return;
         }
         self.size = (cols, rows);
-        {
-            let mut c = self.core.lock().expect("term core");
-            let _ = c.term.resize(cols, rows, 0, 0);
-        }
+        let _ = self.core().term.resize(cols, rows, 1, 1);
         if let Some(m) = &self.master {
             let _ = m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
         }
@@ -272,8 +304,8 @@ impl TermSurface {
             return;
         }
         let bytes = {
-            let mut c = self.core.lock().expect("term core");
-            c.term.scroll_viewport_bottom();
+            let mut c = self.core();
+            c.term.scroll_viewport(ScrollViewport::Bottom);
             let Core { term, keys: enc, .. } = &mut *c;
             keys::encode(enc, term, k)
         };
@@ -283,8 +315,7 @@ impl TermSurface {
     }
 
     pub fn paste(&mut self, text: &str) {
-        let bracketed =
-            self.core.lock().expect("term core").term.mode_get(ghostty_vt::MODE_BRACKETED_PASTE).unwrap_or(false);
+        let bracketed = self.core().term.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
         let mut out = Vec::new();
         if bracketed {
             out.extend_from_slice(b"\x1b[200~");
@@ -298,33 +329,33 @@ impl TermSurface {
     }
 
     pub fn mouse_tracking(&self) -> bool {
-        self.is_pty() && self.core.lock().expect("term core").term.mouse_tracking_enabled().unwrap_or(false)
+        self.is_pty() && self.core().term.is_mouse_tracking().unwrap_or(false)
     }
 
     /// Forward a mouse event to a child that requested mouse reporting.
     /// `col`/`row` are relative to the terminal's top-left cell.
-    pub fn send_mouse(
-        &mut self,
-        action: ffi::GhosttyMouseAction,
-        button: Option<ffi::GhosttyMouseButton>,
-        mods: u16,
-        col: u16,
-        row: u16,
-    ) {
-        let bytes = {
-            let c = self.core.lock().expect("term core");
-            let (Ok(mut enc), Ok(mut ev)) = (MouseEncoder::new(), MouseEvent::new()) else { return };
-            enc.set_from_terminal(&c.term);
-            enc.set_size(self.size.0 as u32, self.size.1 as u32, 1, 1);
-            ev.set_action(action);
-            match button {
-                Some(b) => ev.set_button(b),
-                None => ev.clear_button(),
-            }
-            ev.set_mods(mods);
-            ev.set_position(col as f32, row as f32);
-            enc.encode(&ev).unwrap_or_default()
-        };
+    pub fn send_mouse(&mut self, action: MouseAction, button: Option<MouseButton>, mods: Mods, col: u16, row: u16) {
+        let mut bytes = Vec::new();
+        {
+            let c = self.core();
+            let (Ok(mut enc), Ok(mut ev)) = (mouse::Encoder::new(), mouse::Event::new()) else { return };
+            // One pixel per cell: positions are cell coordinates.
+            enc.set_options_from_terminal(&c.term).set_size(mouse::EncoderSize {
+                screen_width: self.size.0 as u32,
+                screen_height: self.size.1 as u32,
+                cell_width: 1,
+                cell_height: 1,
+                padding_top: 0,
+                padding_bottom: 0,
+                padding_right: 0,
+                padding_left: 0,
+            });
+            ev.set_action(action)
+                .set_button(button)
+                .set_mods(mods)
+                .set_position(mouse::Position { x: col as f32, y: row as f32 });
+            let _ = enc.encode_to_vec(&ev, &mut bytes);
+        }
         if !bytes.is_empty() {
             self.write_child(&bytes);
         }
@@ -334,17 +365,15 @@ impl TermSurface {
     /// alternate screen, otherwise scroll our own scrollback.
     pub fn wheel(&mut self, lines: i32, col: u16, row: u16) {
         if self.mouse_tracking() {
-            let button =
-                if lines < 0 { ghostty_vt::MOUSE_BUTTON_WHEEL_UP } else { ghostty_vt::MOUSE_BUTTON_WHEEL_DOWN };
+            let button = if lines < 0 { MouseButton::Four } else { MouseButton::Five };
             for _ in 0..lines.unsigned_abs().div_ceil(3) {
-                self.send_mouse(ghostty_vt::MOUSE_ACTION_PRESS, Some(button), 0, col, row);
+                self.send_mouse(MouseAction::Press, Some(button), Mods::empty(), col, row);
             }
             return;
         }
         let alt = {
-            let c = self.core.lock().expect("term core");
-            c.term.active_screen().ok() == Some(ActiveScreen::Alternate)
-                && c.term.mode_get(ghostty_vt::MODE_MOUSE_ALTERNATE_SCROLL).unwrap_or(false)
+            let c = self.core();
+            c.term.active_screen().ok() == Some(Screen::Alternate) && c.term.mode(Mode::ALT_SCROLL).unwrap_or(false)
         };
         if alt && self.is_pty() {
             let code = if lines < 0 { crossterm::event::KeyCode::Up } else { crossterm::event::KeyCode::Down };
@@ -353,60 +382,68 @@ impl TermSurface {
             }
             return;
         }
-        self.core.lock().expect("term core").term.scroll_viewport_delta(lines as isize);
+        self.scroll_lines(lines);
     }
 
     pub fn scroll_lines(&mut self, lines: i32) {
-        self.core.lock().expect("term core").term.scroll_viewport_delta(lines as isize);
+        self.core().term.scroll_viewport(ScrollViewport::Delta(lines as isize));
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        self.core.lock().expect("term core").term.scroll_viewport_bottom();
+        self.core().term.scroll_viewport(ScrollViewport::Bottom);
     }
 
     pub fn scroll_to_top(&mut self) {
-        let mut c = self.core.lock().expect("term core");
-        c.term.scroll_viewport_row(0);
+        self.core().term.scroll_viewport(ScrollViewport::Top);
     }
 
     /// Absolute row of the top visible line (for selections).
     pub fn viewport_top(&self) -> usize {
-        self.core.lock().expect("term core").term.scrollbar().map(|s| s.offset).unwrap_or(0)
+        self.scrollbar().1
     }
 
     /// (total rows, viewport offset, viewport length).
     pub fn scrollbar(&self) -> (usize, usize, usize) {
-        self.core.lock().expect("term core").term.scrollbar().map(|s| (s.total, s.offset, s.len)).unwrap_or((0, 0, 0))
+        self.core().term.scrollbar().map(|s| (s.total as usize, s.offset as usize, s.len as usize)).unwrap_or((0, 0, 0))
     }
 
     /// Text between screen-absolute (row, col) positions, inclusive.
     pub fn text_between(&self, start: (usize, usize), end: (usize, usize)) -> String {
         let (start, end) = if start <= end { (start, end) } else { (end, start) };
-        let c = self.core.lock().expect("term core");
-        c.term
-            .read_text_screen((start.1 as u16, start.0 as u32), (end.1 as u16, end.0 as u32), false)
-            .unwrap_or_default()
+        let at = |(row, col): (usize, usize)| Point::Screen(PointCoordinate { x: col as u16, y: row as u32 });
+        read_text(&self.core().term, at(start), at(end))
     }
 
     /// Plain text of the visible viewport rows (tests and word selection).
     pub fn viewport_text(&self) -> Vec<String> {
-        let c = self.core.lock().expect("term core");
+        let c = self.core();
         let rows = c.term.rows().unwrap_or(0);
-        let cols = c.term.cols().unwrap_or(0);
-        (0..rows as u32)
-            .map(|r| c.term.read_text_viewport((0, r), (cols.saturating_sub(1), r), false).unwrap_or_default())
-            .collect()
+        let last = c.term.cols().unwrap_or(1).saturating_sub(1);
+        let at = |x: u16, y: u16| Point::Viewport(PointCoordinate { x, y: y as u32 });
+        (0..rows).map(|r| read_text(&c.term, at(0, r), at(last, r))).collect()
     }
 
     /// Write a status line into the terminal (e.g. "[process exited]").
     pub fn notice(&mut self, text: &str) {
-        let mut c = self.core.lock().expect("term core");
-        c.term.write(format!("\r\n\x1b[0;2m{text}\x1b[0m").as_bytes());
+        self.core().term.vt_write(format!("\r\n\x1b[0;2m{text}\x1b[0m").as_bytes());
     }
 
     /// Mark output as consumed so the next output wakes the app again.
     pub fn ack(&self) {
         self.pending.store(false, Ordering::Release);
+    }
+}
+
+/// Plain text of the inclusive range between two points, as copied to the
+/// clipboard (soft wraps joined, trailing blanks trimmed).
+fn read_text(term: &Terminal<'_, '_>, start: Point, end: Point) -> String {
+    let (Ok(start), Ok(end)) = (term.grid_ref(start), term.grid_ref(end)) else { return String::new() };
+    let sel = libghostty_vt::selection::Selection::new(start, end, false);
+    let opts =
+        FormatOptions::new().with_emit_format(Format::Plain).with_unwrap(true).with_trim(true).with_selection(&sel);
+    match term.format_selection_alloc(None, opts) {
+        Ok(Some(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+        _ => String::new(),
     }
 }
 
@@ -504,9 +541,29 @@ mod tests {
     }
 
     #[test]
+    fn query_replies_reach_child() {
+        // Primary device attributes: the terminal must answer, or programs that
+        // probe the terminal (vim, fish) hang waiting.
+        let t = TermSurface::spawn(
+            &[
+                "sh".into(),
+                "-c".into(),
+                r#"stty raw -echo; printf '\033[c'; r=$(dd bs=1 count=3 2>/dev/null | od -An -c | tr -d ' '); printf '\r\ngot:%s' "$r"; sleep 5"#.into(),
+            ],
+            &[],
+            40,
+            5,
+            nop_wake(),
+            Arc::new(|_, _| {}),
+        )
+        .unwrap();
+        assert!(wait_for(|| t.viewport_text().iter().any(|l| l.contains("got:033[?"))), "{:?}", t.viewport_text());
+    }
+
+    #[test]
     fn writes_never_block_the_caller() {
         // `sleep` never reads stdin, so the PTY input buffer fills up.
-        let t = TermSurface::spawn(
+        let mut t = TermSurface::spawn(
             &["sh".into(), "-c".into(), "stty raw -echo; sleep 30".into()],
             &[],
             20,
@@ -516,15 +573,20 @@ mod tests {
         )
         .unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        let t = Arc::new(Mutex::new(t));
-        let t2 = t.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // Surfaces are !Send, so a watchdog fails the run if the paste blocks.
+        let done = Arc::new(AtomicBool::new(false));
+        let d2 = done.clone();
         std::thread::spawn(move || {
-            let big = "x".repeat(1 << 20);
-            t2.lock().unwrap().paste(&big);
-            let _ = done_tx.send(());
+            std::thread::sleep(Duration::from_secs(5));
+            if !d2.load(Ordering::Acquire) {
+                eprintln!("paste blocked the caller");
+                std::process::exit(101);
+            }
         });
-        assert!(done_rx.recv_timeout(Duration::from_secs(2)).is_ok(), "paste blocked the caller");
+        let start = Instant::now();
+        t.paste(&"x".repeat(1 << 20));
+        done.store(true, Ordering::Release);
+        assert!(start.elapsed() < Duration::from_secs(2), "paste blocked the caller");
     }
 
     #[test]
@@ -533,6 +595,17 @@ mod tests {
         let f = t.feeder(true);
         f.feed(b"one\ntwo\r\nthree\n");
         assert_eq!(&t.viewport_text()[..3], &["one", "two", "three"]);
+    }
+
+    #[test]
+    fn feeders_work_from_other_threads() {
+        let woken = Arc::new(AtomicBool::new(false));
+        let w2 = woken.clone();
+        let t = TermSurface::stream(20, 3, Arc::new(move || w2.store(true, Ordering::Release))).unwrap();
+        let f = t.feeder(true);
+        std::thread::spawn(move || f.feed(b"from a thread\n")).join().unwrap();
+        assert!(woken.load(Ordering::Acquire), "feeding wakes the app");
+        assert_eq!(t.viewport_text()[0], "from a thread");
     }
 
     #[test]

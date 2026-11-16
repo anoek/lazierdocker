@@ -1,10 +1,13 @@
-use ghostty_vt::Terminal;
+use libghostty_vt::terminal::{Point, PointCoordinate};
+use libghostty_vt::{Terminal, TerminalOptions};
 
 #[test]
 fn terminal_roundtrip() {
-    let mut term = Terminal::new(20, 5, 1 << 20).expect("terminal");
-    term.write(b"hi\r\nthere");
-    let text = term.read_text_screen((0, 0), (19, 1), false).expect("text");
-    assert!(text.contains("hi"), "{text:?}");
-    assert!(text.contains("there"), "{text:?}");
+    let mut term = Terminal::new(TerminalOptions { cols: 20, rows: 5, max_scrollback: 1 << 20 }).expect("terminal");
+    term.vt_write(b"hi\r\nthere");
+    let at = |x, y| term.grid_ref(Point::Screen(PointCoordinate { x, y })).expect("grid ref");
+    let mut grapheme = ['\0'; 1];
+    at(0, 1).graphemes(&mut grapheme).expect("graphemes");
+    assert_eq!(grapheme[0], 't');
+    assert_eq!(term.cursor_x().unwrap(), 5);
 }

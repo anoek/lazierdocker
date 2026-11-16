@@ -6,6 +6,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, Mou
 use ratatui::layout::{Position, Rect};
 
 use super::{App, Click, Drag, Effect, Focus, Mode, DOUBLE_CLICK};
+use crate::term::{Mods, MouseAction, MouseButton as TermButton};
 use crate::ui::layout::{clamp_ratio, Dir4, SplitDir};
 use crate::ui::sidebar::{NodeKey, Section, Sidebar, DEFAULT_WIDTH, MAX_WIDTH, MIN_WIDTH};
 
@@ -435,13 +436,13 @@ impl App {
         // Active drags take every event until release.
         if let Some(Drag::TermMouse(pane)) = self.drag.clone() {
             let action = match m.kind {
-                MouseEventKind::Drag(_) => Some(ghostty_vt::MOUSE_ACTION_MOTION),
-                MouseEventKind::Up(_) => Some(ghostty_vt::MOUSE_ACTION_RELEASE),
+                MouseEventKind::Drag(_) => Some(MouseAction::Motion),
+                MouseEventKind::Up(_) => Some(MouseAction::Release),
                 _ => None,
             };
             if let Some(action) = action {
                 self.forward_mouse(pane, action, col, row);
-                if action == ghostty_vt::MOUSE_ACTION_RELEASE {
+                if action == MouseAction::Release {
                     self.drag = None;
                 }
                 return Vec::new();
@@ -537,16 +538,10 @@ impl App {
         Some((col.clamp(r.x, r.right() - 1) - r.x, row.clamp(r.y, r.bottom() - 1) - r.y))
     }
 
-    fn forward_mouse(
-        &mut self,
-        pane: crate::ui::layout::PaneId,
-        action: ghostty_vt::ffi::GhosttyMouseAction,
-        col: u16,
-        row: u16,
-    ) {
+    fn forward_mouse(&mut self, pane: crate::ui::layout::PaneId, action: MouseAction, col: u16, row: u16) {
         let Some((x, y)) = self.content_cell(pane, col, row) else { return };
         if let Some(super::Pane { content: super::Content::Term(t), .. }) = self.panes.get_mut(&pane) {
-            t.send_mouse(action, Some(ghostty_vt::MOUSE_BUTTON_LEFT), 0, x, y);
+            t.send_mouse(action, Some(TermButton::Left), Mods::empty(), x, y);
         }
     }
 
@@ -619,7 +614,7 @@ impl App {
             if tracking {
                 self.focus = Focus::Panes;
                 self.layout.focus = pane;
-                self.forward_mouse(pane, ghostty_vt::MOUSE_ACTION_PRESS, col, row);
+                self.forward_mouse(pane, MouseAction::Press, col, row);
                 self.drag = Some(Drag::TermMouse(pane));
                 return Vec::new();
             }

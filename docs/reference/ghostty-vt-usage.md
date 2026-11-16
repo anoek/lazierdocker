@@ -1,61 +1,64 @@
-# Using the vendored ghostty-vt crate (from herdr, Apache-2.0)
+# Using libghostty-vt (crates.io)
 
-Source: herdr `crates/ghostty-vt` + `vendor/libghostty-vt` (libghostty-vt 1.3.2-HEAD+44f2a44df,
-herdr patches already applied). Vendored verbatim; see NOTICE.
+Dependency: [`libghostty-vt`](https://crates.io/crates/libghostty-vt) 0.2.2, the safe Rust API from
+[libghostty-rs](https://github.com/Uzaaft/libghostty-rs) (MIT OR Apache-2.0, by Uzaaft and Ghostty
+maintainer pluiedev). Its `libghostty-vt-sys` crate builds libghostty-vt from Ghostty commit
+`a887df42` (1.3.2-dev).
 
 ## Build
-- Layout must stay `<root>/crates/ghostty-vt` + `<root>/vendor/` (build.rs:37 and lib.rs:2564 use
-  relative paths).
-- Needs **Zig 0.16.0** on PATH (or `ZIG=`). First build fetches the `uucode` zig dep from the
-  network into zig's global cache.
-- Env: `LIBGHOSTTY_VT_OPTIMIZE` (default ReleaseFast), `LIBGHOSTTY_VT_SIMD`,
-  `LIBGHOSTTY_VT_ZIG_SYSTEM_DIR` (offline deps).
-- Upstream `portable-pty 0.9.0` is fine on unix (herdr's patches are Windows-only).
+- Needs **Zig 0.15.2** on `PATH` (Ghostty's `minimum_zig_version` at that commit; the build script
+  runs plain `zig`). libghostty-rs's git HEAD has moved to Zig 0.17; the crates.io release has not.
+- The first build clones Ghostty into `OUT_DIR` and lets Zig fetch its packages, so it needs network
+  access. Offline: `GHOSTTY_SOURCE_DIR` (a Ghostty checkout) and `GHOSTTY_ZIG_SYSTEM_DIR`.
+- Zig's optimize mode follows the Cargo profile (dev → Debug); `LIBGHOSTTY_VT_SYS_OPTIMIZE` overrides.
+- Linked statically by default.
 
-## API essentials (crates/ghostty-vt/src/lib.rs)
+## Threading
+All handles are `!Send + !Sync` (the C API may keep thread-local state). Each `TermSurface` owns its
+`Terminal` on the UI thread. The PTY pump thread and log `Feeder`s only send bytes over a channel
+and wake the app; `TermSurface::core()` parses queued bytes (at most 4 MB per call) before any
+render or query, then writes query replies back to the child.
+
+## API used (src/term)
 ```rust
-Terminal::new(cols, rows, max_scrollback_BYTES)
-term.write(&bytes)                      // feed child output
-term.resize(cols, rows, cell_w_px, cell_h_px)   // cols first
-term.set_write_pty_callback(|b| ...)    // query replies (DA/DSR/...) — MUST be written back to the PTY
-term.take_clipboard_writes() / take_bell_count() / take_pwd_changes()
-term.mode_get(u16) / mouse_tracking_enabled() / active_screen() / kitty_keyboard_flags()
-term.scrollbar() -> {total, offset, len}; scroll_viewport_delta(isize /*neg=up*/);
-term.scroll_viewport_bottom(); scroll_viewport_row(row)
-term.read_text_screen((col,row),(col,row), rectangle) -> String   // screen-absolute rows
-RenderState::new(); rs.update(&term); rs.colors(); rs.cursor(); rs.clean()
-rs.populate_row_iterator(&mut RowIterator) -> RowIter { next(), populate_cells(&mut RowCells) }
-RowCellIter { next(), basic_data() -> {wide, style}, fg_color(), bg_color(), content_bg_color(),
-              grapheme_text_into(&mut Vec<u8>, &mut String) }
-KeyEvent::new(); set_action/set_key/set_mods/set_utf8/set_unshifted_codepoint/set_consumed_mods
-KeyEncoder::new(); set_from_terminal(&term); set_macos_option_as_alt(true) /*re-set after sync*/; encode(&ev)
-MouseEvent / MouseEncoder { set_from_terminal, set_size(cols,rows,1,1), encode }
+Terminal::new(TerminalOptions { cols, rows, max_scrollback })  // max_scrollback is BYTES in Ghostty
+                                                                // (PageList.max_size), despite the header
+term.vt_write(&bytes); term.resize(cols, rows, 1, 1)
+term.on_pty_write(|_, bytes| ..)        // query replies (DA, DSR, …): must reach the child
+term.mode(Mode::BRACKETED_PASTE / ALT_SCROLL); term.is_mouse_tracking(); term.active_screen()
+term.kitty_keyboard_flags(); term.scrollbar() -> {total, offset, len} (u64)
+term.scroll_viewport(ScrollViewport::{Top, Bottom, Delta(isize), Row(usize)})
+// text: grid_ref(Point::Screen|Viewport) ×2 → Selection::new(a, b, false)
+//       → term.format_selection_alloc(None, FormatOptions{Plain, unwrap, trim, selection})
+let snap = rs.update(&term)?;           // RenderState
+snap.colors(); snap.cursor_visible(); snap.cursor_viewport(); snap.set_dirty(Dirty::Clean)
+let mut it = rows.update(&snap)?; while let Some(row) = it.next() {
+    let mut cells = cell_iter.update(row)?; while let Some(c) = cells.next() {
+        c.raw_cell()?.wide(); c.graphemes_utf8(&mut s) /* appends: clear first */; c.style()
+    }
+    row.set_dirty(false)
+}
+key::Encoder: set_options_from_terminal(&term), then set_macos_option_as_alt(True), encode_to_vec
+key::Event: set_action/key/mods/consumed_mods/utf8/unshifted_codepoint
+mouse::Encoder: set_options_from_terminal + set_size(EncoderSize{cell 1×1}); mouse::Event position = cell
 ```
-- Modes: 1 app cursor, 1004 focus, 1006 SGR mouse, 1007 alt scroll, 2004 bracketed paste,
-  2026 synchronized output. Mouse tracking modes 9/1000/1002/1003 not exported as consts.
-- Send: Terminal, RenderState, KeyEncoder, RowIterator, RowCells. None Sync. KeyEvent/MouseEvent/
-  MouseEncoder not Send → create per call. Keep Terminal+RenderState in one Mutex.
-- No public title getter (parse OSC 0/2 ourselves or add getter).
 
 ## Render mapping (per cell)
 - wide: SpacerTail → "" ; SpacerHead → " " ; empty → " ".
-- fg: style.fg_color (Palette(i)→Indexed(i), Rgb→Rgb) else cells.fg_color() else default(None→Reset).
-- bg: content_bg_color() then style.bg_color then cells.bg_color() else default.
-- invisible: fg=bg; inverse: resolve defaults from rs.colors() then swap.
-- bold→BOLD, italic→ITALIC, faint→DIM, blink→SLOW_BLINK, underlined→UNDERLINED,
-  strikethrough→CROSSED_OUT.
-- Cursor: rs.cursor().viewport Some && visible → frame.set_cursor_position.
-- While mode 2026 set, keep showing last frame.
+- fg: `style.fg_color` (Palette(i) → Indexed(i), Rgb → Rgb, None → Reset).
+- bg: `style.bg_color`, else the raw cell's colour-only content (`BgColorPalette` / `BgColorRgb`).
+- invisible: fg = bg; inverse: resolve defaults from `snap.colors()` then swap.
+- bold → BOLD, italic → ITALIC, faint → DIM, blink → SLOW_BLINK, underline ≠ None → UNDERLINED,
+  strikethrough → CROSSED_OUT.
 
 ## Input
-- Keys: map crossterm → ghostty key + mods; chars: key = lowercase base, unshifted = base, utf8 =
-  produced text, consumed_mods=SHIFT if shift produced it. BackTab = Tab+SHIFT. When kitty flags==0
-  and !modifyOtherKeys, remap e.g. modified Enter→Enter. Scroll to bottom on key input.
-- Mouse: forward only if mouse_tracking_enabled(); encoder.set_size(cols,rows,1,1), position=(col,row).
-- Wheel: tracking on → encoded mouse wheel; alt screen + mode 1007 → arrow keys; else
-  scroll_viewport_delta.
-- Paste: wrap in ESC[200~ … ESC[201~ when mode 2004.
-- Selection: store screen-absolute rows (abs = scrollbar.offset + viewport_row); extract with
-  read_text_screen.
-- Resize: term.resize then master.resize; flush replies.
-- Non-PTY streams (docker logs of non-tty containers): convert `\n` → `\r\n` before feeding.
+- Keys: crossterm → `Key` + `Mods`; chars: key = lowercase base, unshifted = base, utf8 = the
+  character (always, even with Ctrl: Ghostty derives control bytes itself and modifyOtherKeys
+  needs the text), consumed = SHIFT when shift produced plain text. BackTab = Tab + SHIFT.
+- Legacy apps (no Kitty flags, no modifyOtherKeys): Ctrl+Shift+letter → Ctrl+letter, modified
+  Enter → Enter. libghostty-vt has no modifyOtherKeys getter, so `keys::is_legacy` compares the
+  encoder's Ctrl+Shift+A output with and without `modify_other_keys_state_2`.
+- Mouse: forwarded only when `is_mouse_tracking()`. Wheel: tracking → buttons Four/Five;
+  alternate screen + mode 1007 → arrow keys; else scroll the viewport.
+- Paste: wrap in `ESC[200~ … ESC[201~` when mode 2004 is set.
+- Non-PTY streams (logs of non-tty containers): `\n` → `\r\n` before feeding.

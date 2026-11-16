@@ -1,6 +1,8 @@
 //! Draw a libghostty terminal into a ratatui buffer.
 
-use ghostty_vt::{CellColor, CellStyle, CellWide, RenderColors, RgbColor};
+use libghostty_vt::render::Colors;
+use libghostty_vt::screen::{Cell, CellContentTag, CellWide};
+use libghostty_vt::style::{RgbColor, Style as CellStyle, StyleColor, Underline};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -11,16 +13,27 @@ fn rgb(c: RgbColor) -> Color {
     Color::Rgb(c.r, c.g, c.b)
 }
 
-fn cell_color(c: CellColor) -> Color {
+fn style_color(c: StyleColor) -> Option<Color> {
     match c {
-        CellColor::Palette(i) => Color::Indexed(i),
-        CellColor::Rgb(c) => rgb(c),
+        StyleColor::None => None,
+        StyleColor::Palette(i) => Some(Color::Indexed(i.0)),
+        StyleColor::Rgb(c) => Some(rgb(c)),
     }
 }
 
-fn style_for(st: &CellStyle, fg: Option<Color>, bg: Option<Color>, colors: Option<&RenderColors>) -> Style {
-    let mut fg = st.fg_color.map(cell_color).or(fg);
-    let mut bg = st.bg_color.map(cell_color).or(bg);
+/// Background of a cell: its style's, else a colour-only cell's content
+/// (erased with a background set), keeping palette indices as indices.
+fn cell_bg(st: &CellStyle, raw: Option<Cell>) -> Option<Color> {
+    style_color(st.bg_color).or_else(|| match raw?.content_tag().ok()? {
+        CellContentTag::BgColorPalette => Some(Color::Indexed(raw?.bg_color_palette().ok()?.0)),
+        CellContentTag::BgColorRgb => Some(rgb(raw?.bg_color_rgb().ok()?)),
+        _ => None,
+    })
+}
+
+fn style_for(st: &CellStyle, bg: Option<Color>, colors: Option<&Colors>) -> Style {
+    let mut fg = style_color(st.fg_color);
+    let mut bg = bg;
     if st.invisible {
         fg = bg.or_else(|| colors.map(|c| rgb(c.background)));
     }
@@ -31,7 +44,7 @@ fn style_for(st: &CellStyle, fg: Option<Color>, bg: Option<Color>, colors: Optio
         fg = Some(b);
         bg = Some(f);
     }
-    let mut style = Style::default().fg(fg.unwrap_or(Color::Reset)).bg(bg.unwrap_or(Color::Reset));
+    let style = Style::default().fg(fg.unwrap_or(Color::Reset)).bg(bg.unwrap_or(Color::Reset));
     let mut m = Modifier::empty();
     if st.bold {
         m |= Modifier::BOLD;
@@ -45,14 +58,19 @@ fn style_for(st: &CellStyle, fg: Option<Color>, bg: Option<Color>, colors: Optio
     if st.blink {
         m |= Modifier::SLOW_BLINK;
     }
-    if st.underlined {
+    if st.underline != Underline::None {
         m |= Modifier::UNDERLINED;
     }
     if st.strikethrough {
         m |= Modifier::CROSSED_OUT;
     }
-    style = style.add_modifier(m);
-    style
+    style.add_modifier(m)
+}
+
+fn reset_row(buf: &mut Buffer, area: Rect, y: u16, from: u16) {
+    for x in from..area.width {
+        buf[(area.x + x, area.y + y)].reset();
+    }
 }
 
 impl TermSurface {
@@ -64,66 +82,59 @@ impl TermSurface {
         }
         self.resize(area.width, area.height);
         self.ack();
-        let mut guard = self.core.lock().expect("term core");
-        let Core { term, rs, ri, rc, .. } = &mut *guard;
-        if rs.update(term).is_err() {
-            return None;
-        }
-        let colors = rs.colors().ok();
+        let mut guard = self.core();
+        let Core { term, rs, rows, cells, .. } = &mut *guard;
+        let Ok(snap) = rs.update(term) else { return None };
+        let colors = snap.colors().ok();
         let mut cursor = None;
-        if let Ok(cur) = rs.cursor() {
-            if let (true, Some(v)) = (cur.visible, cur.viewport) {
+        if snap.cursor_visible().unwrap_or(false) {
+            if let Ok(Some(v)) = snap.cursor_viewport() {
                 if v.x < area.width && v.y < area.height {
                     cursor = Some((area.x + v.x, area.y + v.y));
                 }
             }
         }
-        let mut gbytes = Vec::new();
         let mut text = String::new();
         let mut y = 0u16;
-        if let Ok(mut rows) = rs.populate_row_iterator(ri) {
-            while y < area.height && rows.next() {
-                let Ok(mut cells) = rows.populate_cells(rc) else { break };
+        if let Ok(mut row_iter) = rows.update(&snap) {
+            while y < area.height {
+                let Some(row) = row_iter.next() else { break };
                 let mut x = 0u16;
-                while x < area.width && cells.next() {
-                    let basic = cells.basic_data().unwrap_or_default();
-                    let symbol: &str = match basic.wide {
-                        CellWide::SpacerTail => "",
-                        CellWide::SpacerHead => " ",
-                        _ => {
-                            if cells.grapheme_text_into(&mut gbytes, &mut text).is_err() || text.is_empty() {
-                                " "
-                            } else {
-                                text.as_str()
+                if let Ok(mut cell_iter) = cells.update(row) {
+                    while x < area.width {
+                        let Some(cell) = cell_iter.next() else { break };
+                        let raw = cell.raw_cell().ok();
+                        let symbol: &str = match raw.and_then(|r| r.wide().ok()) {
+                            Some(CellWide::SpacerTail) => "",
+                            Some(CellWide::SpacerHead) => " ",
+                            _ => {
+                                text.clear();
+                                if cell.graphemes_utf8(&mut text).is_err() || text.is_empty() {
+                                    " "
+                                } else {
+                                    text.as_str()
+                                }
                             }
-                        }
-                    };
-                    let bg = match cells.content_bg_color() {
-                        Ok(Some(c)) => Some(cell_color(c)),
-                        _ => cells.bg_color().ok().flatten().map(rgb),
-                    };
-                    let fg = cells.fg_color().ok().flatten().map(rgb);
-                    let style = style_for(&basic.style, fg, bg, colors.as_ref());
-                    let cell = &mut buf[(area.x + x, area.y + y)];
-                    cell.reset();
-                    cell.set_symbol(symbol);
-                    cell.set_style(style);
-                    x += 1;
+                        };
+                        let st = cell.style().unwrap_or_default();
+                        let style = style_for(&st, cell_bg(&st, raw), colors.as_ref());
+                        let c = &mut buf[(area.x + x, area.y + y)];
+                        c.reset();
+                        c.set_symbol(symbol);
+                        c.set_style(style);
+                        x += 1;
+                    }
                 }
-                while x < area.width {
-                    buf[(area.x + x, area.y + y)].reset();
-                    x += 1;
-                }
+                let _ = row.set_dirty(false);
+                reset_row(buf, area, y, x);
                 y += 1;
             }
         }
         while y < area.height {
-            for x in 0..area.width {
-                buf[(area.x + x, area.y + y)].reset();
-            }
+            reset_row(buf, area, y, 0);
             y += 1;
         }
-        let _ = rs.clean();
+        let _ = snap.set_dirty(libghostty_vt::render::Dirty::Clean);
         cursor
     }
 }

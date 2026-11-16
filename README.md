@@ -94,8 +94,8 @@ through the `com.docker.compose.project.config_files` label.
 
 ## Building
 
-Requires Rust (stable) and **Zig 0.16.0** on `PATH`; Zig builds the vendored libghostty-vt. The first build
-fetches one Zig dependency.
+Requires Rust (stable) and **Zig 0.15.2** on `PATH`. The [`libghostty-vt`](https://crates.io/crates/libghostty-vt)
+crate uses Zig to build libghostty-vt from a pinned Ghostty commit, which the first build downloads from GitHub.
 
     make                      # optimised build → target/release/lazierdocker
     make run ARGS="-H tcp://127.0.0.1:23750"
@@ -124,4 +124,5 @@ disposable daemon, because they restart containers. To set one up:
 
 - Feature set modelled on lazydocker (MIT).
 - Interaction techniques modelled on herdr (Apache-2.0).
-- `crates/ghostty-vt` (herdr's libghostty binding) and `vendor/libghostty-vt` are vendored unchanged; see `NOTICE`.
+- Terminal emulation by libghostty-vt from Ghostty (MIT), through the
+  [libghostty-rs](https://github.com/Uzaaft/libghostty-rs) bindings (MIT OR Apache-2.0).

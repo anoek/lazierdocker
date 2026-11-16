@@ -751,3 +751,90 @@ mod docker_actions {
         }
     }
 }
+
+mod select {
+    use super::*;
+    use ratatui::text::Line;
+
+    /// App with a known document in the inspector, pinned to a section so sync won't replace it.
+    fn doc_app() -> (App, crate::ui::layout::PaneId, Rect) {
+        let mut app = loaded_app();
+        let rows = app.rows().to_vec();
+        app.sidebar.select(&rows, &NodeKey::Section(crate::ui::sidebar::Section::Volumes));
+        app.sync_panes();
+        let pane = app.layout.focus;
+        let lines =
+            vec![Line::raw("alpha beta gamma"), Line::raw("second line here"), Line::raw("see http://x.io/p ok")];
+        app.panes.get_mut(&pane).unwrap().content = Content::Doc(crate::doc::DocSurface::new(lines));
+        draw(&mut app, 100, 20);
+        let r = app.hits.content.iter().find(|(p, _)| *p == pane).unwrap().1;
+        (app, pane, r)
+    }
+
+    #[test]
+    fn drag_selects_and_copies() {
+        let (mut app, _, r) = doc_app();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), r.x + 6, r.y));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), r.x + 5, r.y + 1));
+        let fx = app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), r.x + 5, r.y + 1));
+        assert_eq!(fx, vec![Effect::Copy("beta gamma\nsecond".into())]);
+        // Highlight is painted.
+        let buf = draw(&mut app, 100, 20);
+        assert_eq!(buf[(r.x + 6, r.y)].bg, app.theme.surface1);
+        assert_ne!(buf[(r.x + 5, r.y)].bg, app.theme.surface1);
+        // Any key clears it.
+        app.handle_key(key(KeyCode::Down));
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn click_without_drag_copies_nothing() {
+        let (mut app, pane, r) = doc_app();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), r.x + 2, r.y));
+        let fx = app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), r.x + 2, r.y));
+        assert!(fx.is_empty());
+        assert!(app.selection.is_none());
+        assert_eq!((app.focus, app.layout.focus), (Focus::Panes, pane), "click focuses the pane");
+    }
+
+    #[test]
+    fn double_click_copies_word_or_url() {
+        let (mut app, _, r) = doc_app();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), r.x + 8, r.y));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), r.x + 8, r.y));
+        let fx = app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), r.x + 8, r.y));
+        assert_eq!(fx, vec![Effect::Copy("beta".into())]);
+        app.last_click = None;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), r.x + 10, r.y + 2));
+        let fx = app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), r.x + 10, r.y + 2));
+        assert_eq!(fx, vec![Effect::Copy("http://x.io/p".into())]);
+    }
+
+    #[test]
+    fn drag_past_edge_autoscrolls() {
+        let (mut app, pane, r) = doc_app();
+        app.panes.get_mut(&pane).unwrap().content =
+            Content::Doc(crate::doc::DocSurface::new((0..200).map(|i| Line::raw(format!("row {i}"))).collect()));
+        draw(&mut app, 100, 20);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), r.x, r.y));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), r.x + 3, r.bottom() + 2));
+        let Content::Doc(d) = &app.panes[&pane].content else { panic!() };
+        assert!(d.scroll > 0);
+        let fx = app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), r.x + 3, r.bottom() + 2));
+        let Some(Effect::Copy(text)) = fx.first() else { panic!("{fx:?}") };
+        assert!(text.starts_with("row 0\nrow 1\n") && text.lines().count() > r.height as usize, "{text}");
+    }
+
+    #[test]
+    fn terminal_text_selection() {
+        let (mut app, pane, r) = doc_app();
+        let t = crate::term::TermSurface::stream(r.width, r.height, std::sync::Arc::new(|| {})).unwrap();
+        t.feeder(true).feed(b"hello terminal\nworld\n");
+        app.panes.get_mut(&pane).unwrap().content = Content::Term(t);
+        draw(&mut app, 100, 20);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), r.x + 6, r.y));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), r.x + 4, r.y + 1));
+        let fx = app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), r.x + 4, r.y + 1));
+        assert_eq!(fx, vec![Effect::Copy("terminal\nworld".into())]);
+    }
+}

@@ -13,6 +13,7 @@ pub mod overlay;
 pub mod panes;
 pub mod render;
 pub mod run;
+pub mod selection;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -54,6 +55,8 @@ pub enum Drag {
     },
     /// Mouse gesture forwarded to a terminal pane's program.
     TermMouse(PaneId),
+    /// Selecting text in a pane.
+    Select(PaneId),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -183,6 +186,7 @@ pub struct App {
     /// Transient status message.
     pub toast: Option<(String, Instant)>,
     pub overlay: Option<overlay::Overlay>,
+    pub selection: Option<selection::Selection>,
     /// Running docker operations (status bar).
     pub pending_ops: Vec<String>,
     /// Compose files given on the command line (local project).
@@ -223,6 +227,7 @@ impl App {
             cursor: None,
             toast: None,
             overlay: None,
+            selection: None,
             pending_ops: Vec::new(),
             compose_files: Vec::new(),
             overlay_hits: overlay::OverlayHits::default(),
@@ -247,6 +252,46 @@ impl App {
             return;
         }
         self.dirty = true;
+    }
+
+    /// Top absolute row currently shown in a pane's content.
+    pub fn content_top(&self, pane: PaneId) -> usize {
+        match self.panes.get(&pane).map(|p| &p.content) {
+            Some(Content::Doc(d)) => d.scroll,
+            Some(Content::Term(t)) => t.viewport_top(),
+            None => 0,
+        }
+    }
+
+    /// Absolute (row, col) under a screen position, clamped into the pane's content.
+    pub fn content_pos(&self, pane: PaneId, col: u16, row: u16) -> Option<(usize, usize)> {
+        let (_, r) = self.hits.content.iter().find(|(p, _)| *p == pane)?;
+        if r.width == 0 || r.height == 0 {
+            return None;
+        }
+        let x = col.clamp(r.x, r.right() - 1) - r.x;
+        let y = row.clamp(r.y, r.bottom() - 1) - r.y;
+        Some((self.content_top(pane) + y as usize, x as usize))
+    }
+
+    /// Text of an absolute content row.
+    pub fn content_row_text(&self, pane: PaneId, row: usize) -> String {
+        match self.panes.get(&pane).map(|p| &p.content) {
+            Some(Content::Doc(d)) => d.line_text(row),
+            Some(Content::Term(t)) => {
+                t.text_between((row, 0), (row, self.content_size(pane).0.saturating_sub(1) as usize))
+            }
+            None => String::new(),
+        }
+    }
+
+    pub fn selection_text(&self, sel: &selection::Selection) -> String {
+        let (s, e) = sel.ordered();
+        match self.panes.get(&sel.pane).map(|p| &p.content) {
+            Some(Content::Doc(d)) => d.text_between(s, e),
+            Some(Content::Term(t)) => t.text_between(s, e),
+            None => String::new(),
+        }
     }
 
     /// Size of a pane's content area at the last render (default 80×24).

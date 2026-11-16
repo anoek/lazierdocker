@@ -195,6 +195,9 @@ impl App {
                 .and_then(|p| p.loaded.as_ref())
                 .is_some_and(|k| k.target == key.target && k.tab == key.tab);
             let plan = self.plan_content(&target, tab, id);
+            if !same_view && self.selection.is_some_and(|s| s.pane == id) {
+                self.selection = None;
+            }
             let pane = self.panes.get_mut(&id).expect("pane exists");
             pane.loaded = Some(key.clone());
             match plan {

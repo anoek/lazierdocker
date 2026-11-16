@@ -186,6 +186,21 @@ impl App {
             }
         }
         hits.content.push((id, content_area));
+        self.paint_selection(buf, id, content_area);
+    }
+
+    fn paint_selection(&self, buf: &mut Buffer, id: PaneId, area: Rect) {
+        let Some(sel) = self.selection.filter(|s| s.pane == id && s.is_visible()) else { return };
+        let t = self.theme;
+        let top = self.content_top(id);
+        let style = Style::default().bg(t.surface1).fg(t.text);
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if sel.contains(top + y as usize, x as usize) {
+                    buf[(area.x + x, area.y + y)].set_style(style);
+                }
+            }
+        }
     }
 
     fn render_status(&self, buf: &mut Buffer, area: Rect) {

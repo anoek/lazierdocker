@@ -62,6 +62,7 @@ impl App {
         if self.overlay.is_some() {
             return self.overlay_key(k);
         }
+        self.selection = None;
         match self.mode {
             Mode::Prefix => {
                 self.mode = Mode::Normal;
@@ -385,6 +386,35 @@ impl App {
                 return Vec::new();
             }
         }
+        if let Some(Drag::Select(pane)) = self.drag.clone() {
+            match m.kind {
+                MouseEventKind::Drag(_) => {
+                    self.autoscroll_selection(pane, row);
+                    if let (Some(pos), Some(sel)) = (self.content_pos(pane, col, row), self.selection.as_mut()) {
+                        sel.drag(pos);
+                    }
+                    self.dirty = true;
+                    return Vec::new();
+                }
+                MouseEventKind::Up(_) => {
+                    self.drag = None;
+                    self.dirty = true;
+                    match self.selection.as_mut() {
+                        Some(sel) if sel.phase == super::selection::Phase::Dragging => {
+                            sel.phase = super::selection::Phase::Done;
+                            let sel = *sel;
+                            let text = self.selection_text(&sel);
+                            if !text.is_empty() {
+                                return vec![Effect::Copy(text)];
+                            }
+                        }
+                        _ => self.selection = None,
+                    }
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
         if let Some(drag) = self.drag.clone() {
             match m.kind {
                 MouseEventKind::Drag(MouseButton::Left) => {
@@ -408,6 +438,20 @@ impl App {
             MouseEventKind::ScrollDown => self.wheel(col, row, 3),
             _ => Vec::new(),
         }
+    }
+
+    /// Dragging past the top/bottom edge scrolls the content (herdr: 3–15 lines
+    /// depending on distance; we scroll per drag event).
+    fn autoscroll_selection(&mut self, pane: crate::ui::layout::PaneId, row: u16) {
+        let Some((_, r)) = self.hits.content.iter().find(|(p, _)| *p == pane).copied() else { return };
+        let delta = if row < r.y {
+            -((r.y - row) as i32 * 3).clamp(1, 15)
+        } else if row >= r.bottom() {
+            ((row + 1 - r.bottom()) as i32 * 3).clamp(1, 15)
+        } else {
+            return;
+        };
+        self.scroll_pane(pane, delta);
     }
 
     /// Content-relative cell for a pane, clamped into its content rect.
@@ -434,7 +478,7 @@ impl App {
 
     fn apply_drag(&mut self, drag: &Drag, col: u16, row: u16) {
         match drag {
-            Drag::TermMouse(_) => {}
+            Drag::TermMouse(_) | Drag::Select(_) => {}
             Drag::SidebarWidth => {
                 let max = MAX_WIDTH.min(self.size.0.saturating_sub(20)).max(MIN_WIDTH);
                 self.sidebar.width = (col + 1).clamp(MIN_WIDTH, max);
@@ -452,6 +496,7 @@ impl App {
 
     fn left_down(&mut self, col: u16, row: u16) -> Vec<Effect> {
         self.dirty = true;
+        self.selection = None;
         let double = self.is_double_click(col, row);
         if let Some(div) = self.hits.sidebar_divider {
             if contains(div, col, row) {
@@ -504,6 +549,34 @@ impl App {
                 self.drag = Some(Drag::TermMouse(pane));
                 return Vec::new();
             }
+        }
+        // Text selection in pane content (double-click selects a word).
+        if let Some((pane, _)) = self.hits.content.iter().find(|(_, r)| contains(*r, col, row)).copied() {
+            self.focus = Focus::Panes;
+            self.layout.focus = pane;
+            let Some(pos) = self.content_pos(pane, col, row) else { return Vec::new() };
+            if double {
+                let line = self.content_row_text(pane, pos.0);
+                let idx = crate::doc::col_to_char(&line.chars().collect::<Vec<_>>(), pos.1);
+                if let Some((s, e)) = super::selection::word_bounds(&line, idx) {
+                    let chars: Vec<char> = line.chars().collect();
+                    let col_of = |i: usize| {
+                        chars[..i]
+                            .iter()
+                            .map(|c| unicode_width::UnicodeWidthChar::width(*c).unwrap_or(0))
+                            .sum::<usize>()
+                    };
+                    let mut sel = super::selection::Selection::new(pane, (pos.0, col_of(s)));
+                    sel.drag((pos.0, col_of(e)));
+                    sel.phase = super::selection::Phase::Done;
+                    self.selection = Some(sel);
+                    return vec![Effect::Copy(chars[s..=e].iter().collect())];
+                }
+                return Vec::new();
+            }
+            self.selection = Some(super::selection::Selection::new(pane, pos));
+            self.drag = Some(Drag::Select(pane));
+            return Vec::new();
         }
         if let Some((_, id, tab)) = self.hits.tabs.iter().find(|(r, _, _)| contains(*r, col, row)).cloned() {
             self.focus = Focus::Panes;

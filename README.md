@@ -53,6 +53,11 @@ clipboard. Shells, `docker attach` and logs run in embedded terminals powered by
   - `E` opens an exec shell; `a` attaches to the container.
   - Attached compose commands (rebuild, pull, …) also run in a pane.
   - Keys, mouse, paste (bracketed) and scrollback all work. `ctrl+b` is the only key the app keeps.
+- **Logs:**
+  - Container logs open with the last 1000 lines and follow new output. `f` loads the full history.
+  - When a container restarts, its log stream resumes on its own.
+  - `/` or `ctrl+f` finds text in a logs pane. Matches are highlighted and update as new lines arrive. `n` / `N`
+    step to older / newer matches.
 - **Copy and paste:**
   - Drag to select text in any pane. It is copied on release.
   - Double-click selects a word or URL.
@@ -113,7 +118,9 @@ Linux and macOS are supported.
 
 ## Testing
 
-    cargo test
+    make test
+
+`make test` runs `cargo test` with `~/.local/bin` on `PATH`, so a Zig 0.15.2 installed there is found first.
 
 The integration tests in `tests/docker_integration.rs` run only when `LAZIERDOCKER_TEST_DOCKER_HOST` points at a
 disposable daemon, because they restart containers. To set one up:

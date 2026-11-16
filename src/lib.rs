@@ -5,4 +5,5 @@ pub mod app;
 pub mod doc;
 pub mod docker;
 pub mod event;
+pub mod term;
 pub mod ui;

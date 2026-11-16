@@ -25,13 +25,8 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Section; 5] = [
-        Section::Projects,
-        Section::Containers,
-        Section::Images,
-        Section::Volumes,
-        Section::Networks,
-    ];
+    pub const ALL: [Section; 5] =
+        [Section::Projects, Section::Containers, Section::Images, Section::Volumes, Section::Networks];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -141,14 +136,7 @@ impl Sidebar {
             children: Vec<Item>,
         }
         let leaf = |key: NodeKey, depth: u8, label: String| Item {
-            row: Row {
-                key,
-                depth,
-                expandable: false,
-                expanded: false,
-                last_child: false,
-                label,
-            },
+            row: Row { key, depth, expandable: false, expanded: false, last_child: false, label },
             children: vec![],
         };
         let mut sections = Vec::new();
@@ -169,13 +157,7 @@ impl Sidebar {
                         children: p
                             .services
                             .iter()
-                            .map(|s| {
-                                leaf(
-                                    NodeKey::Service(p.name.clone(), s.name.clone()),
-                                    2,
-                                    s.name.clone(),
-                                )
-                            })
+                            .map(|s| leaf(NodeKey::Service(p.name.clone(), s.name.clone()), 2, s.name.clone()))
                             .collect(),
                     })
                     .collect(),
@@ -184,21 +166,15 @@ impl Sidebar {
                     .filter(|c| container_visible(c, self.show_exited))
                     .map(|c| leaf(NodeKey::Container(c.id.clone()), 1, c.name.clone()))
                     .collect(),
-                Section::Images => snap
-                    .images
-                    .iter()
-                    .map(|i| leaf(NodeKey::Image(i.id.clone()), 1, i.display()))
-                    .collect(),
-                Section::Volumes => snap
-                    .volumes
-                    .iter()
-                    .map(|v| leaf(NodeKey::Volume(v.name.clone()), 1, v.name.clone()))
-                    .collect(),
-                Section::Networks => snap
-                    .networks
-                    .iter()
-                    .map(|n| leaf(NodeKey::Network(n.id.clone()), 1, n.name.clone()))
-                    .collect(),
+                Section::Images => {
+                    snap.images.iter().map(|i| leaf(NodeKey::Image(i.id.clone()), 1, i.display())).collect()
+                }
+                Section::Volumes => {
+                    snap.volumes.iter().map(|v| leaf(NodeKey::Volume(v.name.clone()), 1, v.name.clone())).collect()
+                }
+                Section::Networks => {
+                    snap.networks.iter().map(|n| leaf(NodeKey::Network(n.id.clone()), 1, n.name.clone())).collect()
+                }
             };
             sections.push(Item {
                 row: Row {
@@ -228,17 +204,11 @@ impl Sidebar {
             out.push(row);
             if expanded {
                 // While filtering, a matching parent shows all its children.
-                let self_match = !needle.is_empty()
-                    && out
-                        .last()
-                        .is_some_and(|r| r.label.to_lowercase().contains(needle));
+                let self_match =
+                    !needle.is_empty() && out.last().is_some_and(|r| r.label.to_lowercase().contains(needle));
                 let kids: Vec<Item> = children
                     .into_iter()
-                    .filter(|c| {
-                        depth == 0 && needle.is_empty()
-                            || self_match && depth > 0
-                            || matches(c, needle)
-                    })
+                    .filter(|c| depth == 0 && needle.is_empty() || self_match && depth > 0 || matches(c, needle))
                     .collect();
                 let n = kids.len();
                 for (i, c) in kids.into_iter().enumerate() {
@@ -272,15 +242,9 @@ impl Sidebar {
         // the same section, falling back to that section's header.
         let i = match self.selected.as_ref().map(section_of) {
             Some(section) => {
-                let start = rows
-                    .iter()
-                    .position(|r| r.key == NodeKey::Section(section))
-                    .unwrap_or(0);
-                let end = rows[start + 1..]
-                    .iter()
-                    .position(|r| r.depth == 0)
-                    .map(|p| start + 1 + p)
-                    .unwrap_or(rows.len());
+                let start = rows.iter().position(|r| r.key == NodeKey::Section(section)).unwrap_or(0);
+                let end =
+                    rows[start + 1..].iter().position(|r| r.depth == 0).map(|p| start + 1 + p).unwrap_or(rows.len());
                 if end > start + 1 {
                     self.selected_index.clamp(start + 1, end - 1)
                 } else {
@@ -297,11 +261,7 @@ impl Sidebar {
         if rows.is_empty() {
             return;
         }
-        let cur = self
-            .selected
-            .as_ref()
-            .and_then(|k| rows.iter().position(|r| &r.key == k))
-            .unwrap_or(0) as i64;
+        let cur = self.selected.as_ref().and_then(|k| rows.iter().position(|r| &r.key == k)).unwrap_or(0) as i64;
         let next = (cur + delta as i64).clamp(0, rows.len() as i64 - 1) as usize;
         self.selected = Some(rows[next].key.clone());
         self.selected_index = next;
@@ -332,11 +292,7 @@ impl Sidebar {
     pub fn parent_of(rows: &[Row], key: &NodeKey) -> Option<NodeKey> {
         let i = rows.iter().position(|r| &r.key == key)?;
         let depth = rows[i].depth;
-        rows[..i]
-            .iter()
-            .rev()
-            .find(|r| r.depth < depth)
-            .map(|r| r.key.clone())
+        rows[..i].iter().rev().find(|r| r.depth < depth).map(|r| r.key.clone())
     }
 
     /// Make sure the selection is within the visible window.
@@ -367,39 +323,22 @@ pub struct RenderCtx<'a> {
 }
 
 impl Sidebar {
-    /// Render into `area` (the sidebar including its divider column).
-    pub fn render(
-        &mut self,
-        buf: &mut Buffer,
-        area: Rect,
-        rows: &[Row],
-        ctx: &RenderCtx<'_>,
-    ) -> SidebarHits {
+    /// Render into `area` (content only; the divider belongs to the pane frames).
+    pub fn render(&mut self, buf: &mut Buffer, area: Rect, rows: &[Row], ctx: &RenderCtx<'_>) -> SidebarHits {
         let t = ctx.theme;
         let mut hits = SidebarHits::default();
-        if area.width < 3 || area.height < 2 {
+        if area.width < 2 || area.height < 2 {
             return hits;
         }
-        // Divider on the last column.
+        // The divider is drawn by the pane frames to our right; we own [x, right).
+        let inner = area;
         let div_x = area.right() - 1;
-        for y in area.y..area.bottom() {
-            buf[(div_x, y)]
-                .set_symbol("│")
-                .set_style(Style::default().fg(t.surface1));
-        }
-        let inner = Rect::new(area.x, area.y, area.width - 1, area.height);
         // Header.
         let header = if ctx.filter_editing || !self.filter.is_empty() {
             Line::from(vec![
-                Span::styled(
-                    " / ",
-                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(" / ", Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
                 Span::styled(self.filter.clone(), Style::default().fg(t.text)),
-                Span::styled(
-                    if ctx.filter_editing { "▏" } else { "" },
-                    Style::default().fg(t.accent),
-                ),
+                Span::styled(if ctx.filter_editing { "▏" } else { "" }, Style::default().fg(t.accent)),
             ])
         } else {
             Line::from(vec![Span::styled(
@@ -419,10 +358,7 @@ impl Sidebar {
             let selected = self.selected.as_ref() == Some(&row.key);
             let base = if selected {
                 if ctx.focused {
-                    Style::default()
-                        .bg(t.surface0)
-                        .fg(t.text)
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().bg(t.surface0).fg(t.text).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().bg(t.active_row_bg).fg(t.text)
                 }
@@ -434,33 +370,22 @@ impl Sidebar {
             let mut line = Line::from(spans);
             line = line.patch_style(base.remove_modifier(Modifier::empty()));
             // Right-aligned extra (cpu / size / driver).
-            let right_w = right
-                .as_ref()
-                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()) as u16)
-                .unwrap_or(0);
-            let left_max = if right_w > 0 && list.width > right_w + 12 {
-                list.width - right_w - 1
-            } else {
-                list.width
-            };
+            let right_w =
+                right.as_ref().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()) as u16).unwrap_or(0);
+            let left_max = if right_w > 0 && list.width > right_w + 12 { list.width - right_w - 1 } else { list.width };
             buf.set_line(list.x, y, &line, left_max);
             if let Some(r) = right {
                 if left_max < list.width {
                     let mut s = r;
                     if selected {
-                        s.style = s.style.bg(if ctx.focused {
-                            t.surface0
-                        } else {
-                            t.active_row_bg
-                        });
+                        s.style = s.style.bg(if ctx.focused { t.surface0 } else { t.active_row_bg });
                     }
                     buf.set_span(list.right() - right_w, y, &s, right_w);
                 }
             }
             hits.rows.push((rect, row.key.clone()));
             if let Some(col) = toggle_col {
-                hits.toggles
-                    .push((Rect::new(list.x + col, y, 2, 1), row.key.clone()));
+                hits.toggles.push((Rect::new(list.x + col, y, 2, 1), row.key.clone()));
             }
         }
         // Scrollbar hint when content overflows.
@@ -480,10 +405,7 @@ impl Sidebar {
 }
 
 /// Returns (left spans, optional right-aligned span, toggle column offset).
-fn row_spans(
-    row: &Row,
-    ctx: &RenderCtx<'_>,
-) -> (Vec<Span<'static>>, Option<Span<'static>>, Option<u16>) {
+fn row_spans(row: &Row, ctx: &RenderCtx<'_>) -> (Vec<Span<'static>>, Option<Span<'static>>, Option<u16>) {
     let t = ctx.theme;
     let snap = ctx.snap;
     let caret = |expanded: bool| if expanded { "▾ " } else { "▸ " };
@@ -494,14 +416,8 @@ fn row_spans(
     match &row.key {
         NodeKey::Section(s) => {
             toggle = Some(0);
-            spans.push(Span::styled(
-                caret(row.expanded).to_string(),
-                Style::default().fg(t.accent),
-            ));
-            spans.push(Span::styled(
-                s.title().to_string(),
-                Style::default().fg(t.text).add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled(caret(row.expanded).to_string(), Style::default().fg(t.accent)));
+            spans.push(Span::styled(s.title().to_string(), Style::default().fg(t.text).add_modifier(Modifier::BOLD)));
             let count = match s {
                 Section::Projects => snap.projects.len(),
                 Section::Containers => snap.standalone_containers().count(),
@@ -514,10 +430,7 @@ fn row_spans(
         NodeKey::Project(name) => {
             toggle = Some(1);
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                caret(row.expanded).to_string(),
-                Style::default().fg(t.accent),
-            ));
+            spans.push(Span::styled(caret(row.expanded).to_string(), Style::default().fg(t.accent)));
             let project = snap.project(name);
             spans.push(Span::styled(name.clone(), Style::default().fg(t.text)));
             if let Some(p) = project {
@@ -525,16 +438,10 @@ fn row_spans(
                     .services
                     .iter()
                     .filter(|s| {
-                        s.container_id
-                            .as_deref()
-                            .and_then(|id| snap.container(id))
-                            .is_some_and(|c| c.is_running())
+                        s.container_id.as_deref().and_then(|id| snap.container(id)).is_some_and(|c| c.is_running())
                     })
                     .count();
-                spans.push(Span::styled(
-                    format!(" {running}/{}", p.services.len()),
-                    dim,
-                ));
+                spans.push(Span::styled(format!(" {running}/{}", p.services.len()), dim));
                 if p.local {
                     spans.push(Span::styled(" ●", Style::default().fg(t.mauve)));
                 }
@@ -543,10 +450,8 @@ fn row_spans(
         NodeKey::Service(project, name) => {
             let prefix = if row.last_child { "   └ " } else { "   ├ " };
             spans.push(Span::styled(prefix, Style::default().fg(t.surface1)));
-            let c = snap
-                .service(project, name)
-                .and_then(|s| s.container_id.as_deref())
-                .and_then(|id| snap.container(id));
+            let c =
+                snap.service(project, name).and_then(|s| s.container_id.as_deref()).and_then(|id| snap.container(id));
             match c {
                 Some(c) => {
                     spans.push(Span::styled(
@@ -573,10 +478,7 @@ fn row_spans(
         NodeKey::Container(id) => {
             spans.push(Span::raw("  "));
             if let Some(c) = snap.container(id) {
-                spans.push(Span::styled(
-                    present::state_icon(c.state),
-                    Style::default().fg(present::state_color(c, t)),
-                ));
+                spans.push(Span::styled(present::state_icon(c.state), Style::default().fg(present::state_color(c, t))));
                 spans.push(Span::raw(" "));
                 spans.push(Span::raw(c.name.clone()));
                 if let Some(sub) = present::substatus(c, t) {
@@ -640,16 +542,8 @@ mod tests {
                 created: 0,
                 containers: 1,
             }],
-            volumes: vec![Volume {
-                name: "demo_dbdata".into(),
-                driver: "local".into(),
-                labelled: true,
-            }],
-            networks: vec![Network {
-                id: "n1".into(),
-                name: "bridge".into(),
-                driver: "bridge".into(),
-            }],
+            volumes: vec![Volume { name: "demo_dbdata".into(), driver: "local".into(), labelled: true }],
+            networks: vec![Network { id: "n1".into(), name: "bridge".into(), driver: "bridge".into() }],
         }
     }
 
@@ -712,34 +606,13 @@ mod tests {
         let mut sb = Sidebar::default();
         sb.filter = "WEB".into();
         let rows = sb.rows(&snap());
-        assert_eq!(
-            keys(&rows),
-            vec![
-                "#Projects",
-                "demo",
-                "web",
-                "#Containers",
-                "#Images",
-                "#Volumes",
-                "#Networks"
-            ]
-        );
+        assert_eq!(keys(&rows), vec!["#Projects", "demo", "web", "#Containers", "#Images", "#Volumes", "#Networks"]);
         sb.filter = "demo".into();
         let rows = sb.rows(&snap());
         // A matching parent shows all its children; collapsed sections open while filtering.
         assert_eq!(
             keys(&rows),
-            vec![
-                "#Projects",
-                "demo",
-                "db",
-                "web",
-                "#Containers",
-                "#Images",
-                "#Volumes",
-                "demo_dbdata",
-                "#Networks"
-            ]
+            vec!["#Projects", "demo", "db", "web", "#Containers", "#Images", "#Volumes", "demo_dbdata", "#Networks"]
         );
     }
 
@@ -756,12 +629,7 @@ mod tests {
         let mut sb = Sidebar::default();
         let mut s = snap();
         let rows = sb.rows(&s);
-        let loner = rows
-            .iter()
-            .find(|r| r.label == "loner")
-            .unwrap()
-            .key
-            .clone();
+        let loner = rows.iter().find(|r| r.label == "loner").unwrap().key.clone();
         sb.select(&rows, &loner);
         // loner removed
         s.containers.retain(|c| c.name != "loner");
@@ -798,14 +666,8 @@ mod tests {
         let theme = Theme::default();
         let area = Rect::new(0, 0, 30, 8);
         let mut buf = Buffer::empty(area);
-        let ctx = RenderCtx {
-            snap: &s,
-            cpu: &cpu,
-            theme: &theme,
-            focused: true,
-            title: "docker",
-            filter_editing: false,
-        };
+        let ctx =
+            RenderCtx { snap: &s, cpu: &cpu, theme: &theme, focused: true, title: "docker", filter_editing: false };
         let hits = sb.render(&mut buf, area, &rows, &ctx);
         assert_eq!(hits.rows.len(), 7, "header takes one row");
         let line1: String = (0..29).map(|x| buf[(x, 1)].symbol().to_string()).collect();

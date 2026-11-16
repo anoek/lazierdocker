@@ -4,9 +4,7 @@
 use lazierdocker::docker::client::Docker;
 
 fn test_host() -> Option<String> {
-    std::env::var("LAZIERDOCKER_TEST_DOCKER_HOST")
-        .ok()
-        .filter(|s| !s.is_empty())
+    std::env::var("LAZIERDOCKER_TEST_DOCKER_HOST").ok().filter(|s| !s.is_empty())
 }
 
 #[tokio::test]

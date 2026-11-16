@@ -23,12 +23,7 @@ pub enum Dir4 {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
     Pane(PaneId),
-    Split {
-        dir: SplitDir,
-        ratio: f32,
-        first: Box<Node>,
-        second: Box<Node>,
-    },
+    Split { dir: SplitDir, ratio: f32, first: Box<Node>, second: Box<Node> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,10 +70,7 @@ fn split_rect(area: Rect, dir: SplitDir, ratio: f32) -> (Rect, Rect) {
             let first_h = ((area.height as f32) * ratio).round() as u16;
             let first_h = first_h.min(area.height);
             let second_h = area.height - first_h;
-            (
-                Rect::new(area.x, area.y, area.width, first_h),
-                Rect::new(area.x, area.y + first_h, area.width, second_h),
-            )
+            (Rect::new(area.x, area.y, area.width, first_h), Rect::new(area.x, area.y + first_h, area.width, second_h))
         }
     }
 }
@@ -104,12 +96,7 @@ impl Node {
     fn collect_rects(&self, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
         match self {
             Node::Pane(p) => out.push((*p, area)),
-            Node::Split {
-                dir,
-                ratio,
-                first,
-                second,
-            } => {
+            Node::Split { dir, ratio, first, second } => {
                 let (a, b) = split_rect(area, *dir, *ratio);
                 first.collect_rects(a, out);
                 second.collect_rects(b, out);
@@ -118,24 +105,13 @@ impl Node {
     }
 
     fn collect_splits(&self, area: Rect, path: &mut Vec<bool>, out: &mut Vec<SplitBorder>) {
-        if let Node::Split {
-            dir,
-            ratio,
-            first,
-            second,
-        } = self
-        {
+        if let Node::Split { dir, ratio, first, second } = self {
             let (a, b) = split_rect(area, *dir, *ratio);
             let pos = match dir {
                 SplitDir::Horizontal => b.x,
                 SplitDir::Vertical => b.y,
             };
-            out.push(SplitBorder {
-                pos,
-                dir: *dir,
-                area,
-                path: path.clone(),
-            });
+            out.push(SplitBorder { pos, dir: *dir, area, path: path.clone() });
             path.push(false);
             first.collect_splits(a, path, out);
             path.pop();
@@ -168,9 +144,7 @@ impl Node {
                 true
             }
             Node::Pane(_) => false,
-            Node::Split { first, second, .. } => {
-                first.replace_leaf(target, f) || second.replace_leaf(target, f)
-            }
+            Node::Split { first, second, .. } => first.replace_leaf(target, f) || second.replace_leaf(target, f),
         }
     }
 
@@ -211,11 +185,7 @@ impl Node {
 
 impl Layout {
     pub fn new(id: PaneId) -> Self {
-        Self {
-            root: Node::Pane(id),
-            focus: id,
-            zoomed: false,
-        }
+        Self { root: Node::Pane(id), focus: id, zoomed: false }
     }
 
     pub fn contains(&self, id: PaneId) -> bool {
@@ -308,11 +278,7 @@ impl Layout {
             }
             let (edge_dist, overlap, centre) = match dir {
                 Dir4::Left | Dir4::Right => {
-                    let side_ok = if dir == Dir4::Left {
-                        r.right() <= cur.x
-                    } else {
-                        r.x >= cur.right()
-                    };
+                    let side_ok = if dir == Dir4::Left { r.right() <= cur.x } else { r.x >= cur.right() };
                     if !side_ok {
                         continue;
                     }
@@ -322,17 +288,11 @@ impl Layout {
                     } else {
                         r.x as i32 - cur.right() as i32
                     };
-                    let centre = ((r.y as i32 * 2 + r.height as i32)
-                        - (cur.y as i32 * 2 + cur.height as i32))
-                        .abs();
+                    let centre = ((r.y as i32 * 2 + r.height as i32) - (cur.y as i32 * 2 + cur.height as i32)).abs();
                     (edge, overlap, centre)
                 }
                 Dir4::Up | Dir4::Down => {
-                    let side_ok = if dir == Dir4::Up {
-                        r.bottom() <= cur.y
-                    } else {
-                        r.y >= cur.bottom()
-                    };
+                    let side_ok = if dir == Dir4::Up { r.bottom() <= cur.y } else { r.y >= cur.bottom() };
                     if !side_ok {
                         continue;
                     }
@@ -342,9 +302,7 @@ impl Layout {
                     } else {
                         r.y as i32 - cur.bottom() as i32
                     };
-                    let centre = ((r.x as i32 * 2 + r.width as i32)
-                        - (cur.x as i32 * 2 + cur.width as i32))
-                        .abs();
+                    let centre = ((r.x as i32 * 2 + r.width as i32) - (cur.x as i32 * 2 + cur.width as i32)).abs();
                     (edge, overlap, centre)
                 }
             };
@@ -381,16 +339,11 @@ impl Layout {
             s.dir == want
                 && s.pos.abs_diff(edge) <= 1
                 && match want {
-                    SplitDir::Horizontal => {
-                        overlap(cur.y, cur.bottom(), s.area.y, s.area.bottom()) > 0
-                    }
+                    SplitDir::Horizontal => overlap(cur.y, cur.bottom(), s.area.y, s.area.bottom()) > 0,
                     SplitDir::Vertical => overlap(cur.x, cur.right(), s.area.x, s.area.right()) > 0,
                 }
         };
-        let target = splits
-            .iter()
-            .find(|s| touches(s, edge_a))
-            .or_else(|| splits.iter().find(|s| touches(s, edge_b)));
+        let target = splits.iter().find(|s| touches(s, edge_a)).or_else(|| splits.iter().find(|s| touches(s, edge_b)));
         if let Some(s) = target.cloned() {
             let sign = match dir {
                 Dir4::Right | Dir4::Down => 1.0,
@@ -427,10 +380,7 @@ mod tests {
         assert!(l.split(B, SplitDir::Vertical, C));
         let rects = l.rects(area());
         assert_eq!(rects.len(), 3);
-        let total: u32 = rects
-            .iter()
-            .map(|(_, r)| r.width as u32 * r.height as u32)
-            .sum();
+        let total: u32 = rects.iter().map(|(_, r)| r.width as u32 * r.height as u32).sum();
         assert_eq!(total, 100 * 40);
         assert_eq!(rects[0], (A, Rect::new(0, 0, 50, 40)));
         assert_eq!(rects[1], (B, Rect::new(50, 0, 50, 20)));
@@ -471,10 +421,7 @@ mod tests {
         let s = l.splits(area());
         assert_eq!(s.len(), 2);
         assert_eq!((s[0].pos, s[0].path.clone()), (50, vec![]));
-        assert_eq!(
-            (s[1].pos, s[1].path.clone(), s[1].dir),
-            (20, vec![true], SplitDir::Vertical)
-        );
+        assert_eq!((s[1].pos, s[1].path.clone(), s[1].dir), (20, vec![true], SplitDir::Vertical));
     }
 
     #[test]

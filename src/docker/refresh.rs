@@ -37,9 +37,7 @@ pub fn spawn_refresh(docker: Docker, local: Option<LocalCompose>, tx: EventTx) -
         let tx = tx.clone();
         tokio::spawn(async move {
             loop {
-                let mut stream = docker
-                    .api
-                    .events(None::<bollard::query_parameters::EventsOptions>);
+                let mut stream = docker.api.events(None::<bollard::query_parameters::EventsOptions>);
                 while let Some(ev) = stream.next().await {
                     match ev {
                         Ok(_) => notify.notify_one(),
@@ -98,9 +96,7 @@ mod tests {
         let docker = Docker::connect_to("tcp://127.0.0.1:1").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let _r = spawn_refresh(docker, None, tx);
-        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("event within 3s");
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await.expect("event within 3s");
         assert!(matches!(ev, Some(AppEvent::DockerError(_))), "{ev:?}");
     }
 }

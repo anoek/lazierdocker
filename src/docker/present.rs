@@ -51,12 +51,9 @@ pub fn health_span(h: Health, theme: &Theme) -> Span<'static> {
 /// Substatus: `(exitCode)` for exited containers, health glyph for running ones.
 pub fn substatus(c: &Container, theme: &Theme) -> Option<Span<'static>> {
     match c.state {
-        ContainerState::Exited => c.exit_code.map(|code| {
-            Span::styled(
-                format!("({code})"),
-                Style::default().fg(state_color(c, theme)),
-            )
-        }),
+        ContainerState::Exited => {
+            c.exit_code.map(|code| Span::styled(format!("({code})"), Style::default().fg(state_color(c, theme))))
+        }
         _ => c.health.map(|h| health_span(h, theme)),
     }
 }
@@ -141,12 +138,7 @@ mod tests {
     use crate::docker::model::tests::container;
 
     fn port(ip: Option<&str>, private: u16, public: Option<u16>) -> Port {
-        Port {
-            ip: ip.map(Into::into),
-            private,
-            public,
-            proto: "tcp".into(),
-        }
+        Port { ip: ip.map(Into::into), private, public, proto: "tcp".into() }
     }
 
     #[test]
@@ -157,20 +149,13 @@ mod tests {
             port(Some("127.0.0.1"), 5432, Some(5432)),
             port(None, 6379, None),
         ];
-        assert_eq!(
-            ports(&ps),
-            "8080->80/tcp, 127.0.0.1:5432->5432/tcp, 6379/tcp"
-        );
+        assert_eq!(ports(&ps), "8080->80/tcp, 127.0.0.1:5432->5432/tcp, 6379/tcp");
     }
 
     #[test]
     fn browser_url_first_published() {
         assert_eq!(
-            browser_url(&[
-                port(None, 6379, None),
-                port(Some("0.0.0.0"), 80, Some(8080))
-            ])
-            .as_deref(),
+            browser_url(&[port(None, 6379, None), port(Some("0.0.0.0"), 80, Some(8080))]).as_deref(),
             Some("http://localhost:8080/")
         );
         assert_eq!(browser_url(&[port(None, 6379, None)]), None);

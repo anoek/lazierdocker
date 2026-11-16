@@ -28,31 +28,17 @@ impl StatsSample {
         let (rx, tx) = s
             .networks
             .as_ref()
-            .map(|n| {
-                n.values().fold((0, 0), |(r, t), v| {
-                    (r + v.rx_bytes.unwrap_or(0), t + v.tx_bytes.unwrap_or(0))
-                })
-            })
+            .map(|n| n.values().fold((0, 0), |(r, t), v| (r + v.rx_bytes.unwrap_or(0), t + v.tx_bytes.unwrap_or(0))))
             .unwrap_or((0, 0));
         StatsSample {
-            cpu_total: cpu
-                .and_then(|c| c.cpu_usage.as_ref())
-                .and_then(|u| u.total_usage)
-                .unwrap_or(0),
-            precpu_total: pre
-                .and_then(|c| c.cpu_usage.as_ref())
-                .and_then(|u| u.total_usage)
-                .unwrap_or(0),
+            cpu_total: cpu.and_then(|c| c.cpu_usage.as_ref()).and_then(|u| u.total_usage).unwrap_or(0),
+            precpu_total: pre.and_then(|c| c.cpu_usage.as_ref()).and_then(|u| u.total_usage).unwrap_or(0),
             system: cpu.and_then(|c| c.system_cpu_usage).unwrap_or(0),
             presystem: pre.and_then(|c| c.system_cpu_usage).unwrap_or(0),
             online_cpus: cpu
                 .and_then(|c| {
-                    c.online_cpus.or_else(|| {
-                        c.cpu_usage
-                            .as_ref()
-                            .and_then(|u| u.percpu_usage.as_ref())
-                            .map(|p| p.len() as u32)
-                    })
+                    c.online_cpus
+                        .or_else(|| c.cpu_usage.as_ref().and_then(|u| u.percpu_usage.as_ref()).map(|p| p.len() as u32))
                 })
                 .unwrap_or(1),
             mem_usage: s.memory_stats.as_ref().and_then(|m| m.usage).unwrap_or(0),
@@ -126,17 +112,9 @@ mod tests {
             ..Default::default()
         };
         assert!((s.cpu_percent() - 40.0).abs() < 1e-9);
-        let zero = StatsSample {
-            system: 5,
-            presystem: 5,
-            ..Default::default()
-        };
+        let zero = StatsSample { system: 5, presystem: 5, ..Default::default() };
         assert_eq!(zero.cpu_percent(), 0.0);
-        let mem = StatsSample {
-            mem_usage: 25,
-            mem_limit: 100,
-            ..Default::default()
-        };
+        let mem = StatsSample { mem_usage: 25, mem_limit: 100, ..Default::default() };
         assert_eq!(mem.mem_percent(), 25.0);
     }
 
@@ -146,13 +124,7 @@ mod tests {
         let t0 = Instant::now();
         h.push(t0, StatsSample::default());
         h.push(t0 + Duration::from_secs(100), StatsSample::default());
-        h.push(
-            t0 + Duration::from_secs(200),
-            StatsSample {
-                pids: 7,
-                ..Default::default()
-            },
-        );
+        h.push(t0 + Duration::from_secs(200), StatsSample { pids: 7, ..Default::default() });
         assert_eq!(h.samples.len(), 2);
         assert_eq!(h.latest().unwrap().pids, 7);
         assert_eq!(h.span(), Duration::from_secs(100));

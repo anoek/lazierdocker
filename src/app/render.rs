@@ -1,0 +1,182 @@
+//! Compose (geometry + hit map) and draw. The only place that writes `hits`.
+
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::Frame;
+
+use super::{App, Focus, Hits, Mode, PaneKind};
+use crate::ui::borders::{self, PaneFrame};
+use crate::ui::sidebar::{NodeKey, RenderCtx};
+use crate::ui::statusbar::{self, Status};
+
+type StatusHints<'a> = (Option<(&'a str, ratatui::style::Color)>, &'a [(&'a str, &'a str)]);
+
+impl App {
+    pub fn render(&mut self, frame: &mut Frame<'_>) {
+        let area = frame.area();
+        self.render_buf(frame.buffer_mut(), area);
+    }
+
+    pub fn render_buf(&mut self, buf: &mut Buffer, area: Rect) {
+        self.size = (area.width, area.height);
+        let mut hits = Hits::default();
+        let t = self.theme;
+        buf.set_style(area, Style::default().fg(t.text));
+        if area.width < 20 || area.height < 4 {
+            buf.set_stringn(area.x, area.y, "terminal too small", area.width as usize, Style::default().fg(t.red));
+            self.hits = hits;
+            return;
+        }
+        let status_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+        let main = Rect::new(area.x, area.y, area.width, area.height - 1);
+
+        let sidebar_w = if self.sidebar_visible { self.sidebar.width.min(main.width.saturating_sub(20)) } else { 0 };
+        // The sidebar's last column is shared with the panes' left frame line.
+        let sidebar_area = Rect::new(main.x, main.y, sidebar_w.saturating_sub(1), main.height);
+        let pane_x = main.x + sidebar_w.saturating_sub(1);
+        let pane_area = Rect::new(pane_x, main.y, main.right() - pane_x, main.height);
+        hits.sidebar_area = sidebar_area;
+        hits.pane_area = pane_area;
+
+        if sidebar_w >= 3 {
+            let rows = self.rows().to_vec();
+            let ctx = RenderCtx {
+                snap: &self.snap,
+                cpu: &self.cpu,
+                theme: &t,
+                focused: self.focus == Focus::Sidebar,
+                title: "lazierdocker",
+                filter_editing: self.mode == Mode::Filter,
+            };
+            hits.sidebar = self.sidebar.render(buf, sidebar_area, &rows, &ctx);
+            hits.sidebar_divider = Some(Rect::new(pane_area.x, pane_area.y, 1, pane_area.height));
+        }
+
+        // Panes.
+        let rects = self.layout.rects(pane_area);
+        let titles: Vec<(crate::ui::layout::PaneId, String)> =
+            rects.iter().map(|(id, _)| (*id, self.pane_title(*id))).collect();
+        let frames: Vec<PaneFrame<'_>> = rects
+            .iter()
+            .zip(titles.iter())
+            .map(|((id, rect), (_, title))| PaneFrame {
+                id: *id,
+                rect: *rect,
+                title,
+                focused: self.focus == Focus::Panes && *id == self.layout.focus,
+            })
+            .collect();
+        let inners = borders::draw(buf, pane_area, &frames, &t);
+        for (id, rect) in &rects {
+            let inner = inners.get(id).copied().unwrap_or_default();
+            hits.panes.push((*id, *rect, inner));
+            self.render_pane(buf, *id, inner);
+        }
+        hits.splits = self.layout.splits(pane_area);
+
+        self.render_status(buf, status_area);
+        self.hits = hits;
+    }
+
+    pub fn pane_title(&self, id: crate::ui::layout::PaneId) -> String {
+        match self.panes.get(&id).map(|p| &p.kind) {
+            Some(PaneKind::Inspector) => match self.selected() {
+                Some(key) => self.target_label(key),
+                None => "inspector".into(),
+            },
+            None => String::new(),
+        }
+    }
+
+    pub fn target_label(&self, key: &NodeKey) -> String {
+        match key {
+            NodeKey::Section(s) => s.title().to_string(),
+            NodeKey::Project(p) => format!("project {p}"),
+            NodeKey::Service(p, s) => format!("{p} › {s}"),
+            NodeKey::Container(id) => {
+                self.snap.container(id).map(|c| c.name.clone()).unwrap_or_else(|| "container (gone)".into())
+            }
+            NodeKey::Image(id) => self
+                .snap
+                .images
+                .iter()
+                .find(|i| &i.id == id)
+                .map(|i| i.display())
+                .unwrap_or_else(|| "image (gone)".into()),
+            NodeKey::Volume(n) => format!("volume {n}"),
+            NodeKey::Network(id) => self
+                .snap
+                .networks
+                .iter()
+                .find(|n| &n.id == id)
+                .map(|n| format!("network {}", n.name))
+                .unwrap_or_else(|| "network (gone)".into()),
+        }
+    }
+
+    fn render_pane(&mut self, buf: &mut Buffer, _id: crate::ui::layout::PaneId, inner: Rect) {
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let t = self.theme;
+        let msg = if !self.loaded {
+            match &self.docker_error {
+                Some(e) => format!("Cannot reach docker: {e}"),
+                None => "Connecting to docker…".to_string(),
+            }
+        } else {
+            match self.selected() {
+                Some(k) => self.target_label(k),
+                None => "Nothing selected".into(),
+            }
+        };
+        buf.set_line(
+            inner.x + 1,
+            inner.y,
+            &Line::from(Span::styled(msg, Style::default().fg(t.subtext0))),
+            inner.width.saturating_sub(1),
+        );
+    }
+
+    fn render_status(&self, buf: &mut Buffer, area: Rect) {
+        let t = self.theme;
+        let (pill, hints): StatusHints<'_> = match self.mode {
+            Mode::Prefix => (
+                Some(("PREFIX", t.accent)),
+                &[
+                    ("v", "split →"),
+                    ("-", "split ↓"),
+                    ("x", "close"),
+                    ("z", "zoom"),
+                    ("hjkl", "focus"),
+                    ("b", "sidebar"),
+                    ("q", "quit"),
+                    ("esc", "cancel"),
+                ],
+            ),
+            Mode::Filter => (Some(("FILTER", t.mauve)), &[("enter", "keep"), ("esc", "clear")]),
+            Mode::Normal => match self.focus {
+                Focus::Sidebar => (
+                    None,
+                    &[
+                        ("↑↓", "select"),
+                        ("←→", "fold"),
+                        ("/", "filter"),
+                        ("e", "exited"),
+                        ("enter", "pane"),
+                        ("^b", "window"),
+                        ("q", "quit"),
+                    ],
+                ),
+                Focus::Panes => (None, &[("tab", "sidebar"), ("^b", "window"), ("q", "quit")]),
+            },
+        };
+        let right = match &self.docker_error {
+            Some(e) => Some((format!("⚠ {e}"), true)),
+            None => Some((self.host.clone(), false)),
+        };
+        statusbar::render(buf, area, &Status { pill, hints, right }, &t);
+    }
+}

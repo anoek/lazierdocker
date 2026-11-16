@@ -34,25 +34,15 @@ fn outline(area: Rect, r: Rect) -> Option<(u16, u16, u16, u16)> {
     if r.width == 0 || r.height == 0 {
         return None;
     }
-    let right = if r.right() >= area.right() {
-        r.right() - 1
-    } else {
-        r.right()
-    };
-    let bottom = if r.bottom() >= area.bottom() {
-        r.bottom() - 1
-    } else {
-        r.bottom()
-    };
+    let right = if r.right() >= area.right() { r.right() - 1 } else { r.right() };
+    let bottom = if r.bottom() >= area.bottom() { r.bottom() - 1 } else { r.bottom() };
     Some((r.x, r.y, right, bottom))
 }
 
 /// Inner (content) rect for a pane rect inside `area`.
 pub fn inner(area: Rect, r: Rect) -> Rect {
     match outline(area, r) {
-        Some((l, t, rt, b)) if rt > l + 1 && b > t + 1 => {
-            Rect::new(l + 1, t + 1, rt - l - 1, b - t - 1)
-        }
+        Some((l, t, rt, b)) if rt > l + 1 && b > t + 1 => Rect::new(l + 1, t + 1, rt - l - 1, b - t - 1),
         Some((l, t, _, _)) => Rect::new(l, t, 0, 0),
         None => Rect::new(r.x, r.y, 0, 0),
     }
@@ -65,12 +55,8 @@ fn glyph(c: LineCell) -> &'static str {
         (true, true, false, true) => "├",
         (true, false, true, true) => "┴",
         (false, true, true, true) => "┬",
-        (true, true, false, false) | (true, false, false, false) | (false, true, false, false) => {
-            "│"
-        }
-        (false, false, true, true) | (false, false, true, false) | (false, false, false, true) => {
-            "─"
-        }
+        (true, true, false, false) | (true, false, false, false) | (false, true, false, false) => "│",
+        (false, false, true, true) | (false, false, true, false) | (false, false, false, true) => "─",
         (false, true, false, true) => "┌",
         (false, true, true, false) => "┐",
         (true, false, false, true) => "└",
@@ -80,12 +66,7 @@ fn glyph(c: LineCell) -> &'static str {
 }
 
 /// Draw all pane frames and titles. Returns the inner rect of each pane.
-pub fn draw(
-    buf: &mut Buffer,
-    area: Rect,
-    panes: &[PaneFrame<'_>],
-    theme: &Theme,
-) -> HashMap<PaneId, Rect> {
+pub fn draw(buf: &mut Buffer, area: Rect, panes: &[PaneFrame<'_>], theme: &Theme) -> HashMap<PaneId, Rect> {
     let mut cells: HashMap<(u16, u16), LineCell> = HashMap::new();
     let mut inners = HashMap::new();
     for p in panes {
@@ -144,9 +125,7 @@ pub fn draw(
         let title = truncate(p.title, max.saturating_sub(2));
         let label = format!(" {title} ");
         let style = if p.focused {
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.overlay0)
         };
@@ -195,16 +174,8 @@ mod tests {
         l.split(PaneId(1), SplitDir::Horizontal, PaneId(2));
         l.split(PaneId(1), SplitDir::Vertical, PaneId(3));
         l.split(PaneId(2), SplitDir::Vertical, PaneId(4));
-        let frames: Vec<PaneFrame> = l
-            .rects(area)
-            .into_iter()
-            .map(|(id, rect)| PaneFrame {
-                id,
-                rect,
-                title: "",
-                focused: false,
-            })
-            .collect();
+        let frames: Vec<PaneFrame> =
+            l.rects(area).into_iter().map(|(id, rect)| PaneFrame { id, rect, title: "", focused: false }).collect();
         let mut buf = Buffer::empty(area);
         draw(&mut buf, area, &frames, &Theme::default());
         assert_eq!(sym(&buf, 0, 0), "┌");
@@ -231,12 +202,7 @@ mod tests {
     #[test]
     fn title_drawn_on_top_border_truncated() {
         let area = Rect::new(0, 0, 12, 4);
-        let frames = [PaneFrame {
-            id: PaneId(1),
-            rect: area,
-            title: "a-very-long-title",
-            focused: true,
-        }];
+        let frames = [PaneFrame { id: PaneId(1), rect: area, title: "a-very-long-title", focused: true }];
         let mut buf = Buffer::empty(area);
         draw(&mut buf, area, &frames, &Theme::default());
         let top: String = (0..12).map(|x| sym(&buf, x, 0).to_string()).collect();

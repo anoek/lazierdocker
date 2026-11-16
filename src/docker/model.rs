@@ -5,8 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bollard::models::{
-    ContainerSummary, ContainerSummaryStateEnum, ImageSummary, Network as BNetwork, PortSummary,
-    Volume as BVolume,
+    ContainerSummary, ContainerSummaryStateEnum, ImageSummary, Network as BNetwork, PortSummary, Volume as BVolume,
 };
 
 pub const LABEL_PROJECT: &str = "com.docker.compose.project";
@@ -91,10 +90,7 @@ impl Container {
     }
 
     pub fn is_running(&self) -> bool {
-        matches!(
-            self.state,
-            ContainerState::Running | ContainerState::Restarting | ContainerState::Paused
-        )
+        matches!(self.state, ContainerState::Running | ContainerState::Restarting | ContainerState::Paused)
     }
 }
 
@@ -171,17 +167,12 @@ impl Snapshot {
     }
 
     pub fn service(&self, project: &str, name: &str) -> Option<&Service> {
-        self.project(project)?
-            .services
-            .iter()
-            .find(|s| s.name == name)
+        self.project(project)?.services.iter().find(|s| s.name == name)
     }
 
     /// Containers not represented by a compose service row (one-offs and plain containers).
     pub fn standalone_containers(&self) -> impl Iterator<Item = &Container> {
-        self.containers
-            .iter()
-            .filter(|c| c.oneoff || c.service.is_none() || c.project.is_none())
+        self.containers.iter().filter(|c| c.oneoff || c.service.is_none() || c.project.is_none())
     }
 }
 
@@ -230,18 +221,13 @@ fn port_from(p: &PortSummary) -> Port {
         ip: p.ip.clone().filter(|s| !s.is_empty()),
         private: p.private_port,
         public: p.public_port,
-        proto: p
-            .typ
-            .map(|t| t.to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "tcp".into()),
+        proto: p.typ.map(|t| t.to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "tcp".into()),
     }
 }
 
 impl Container {
     pub fn from_summary(s: &ContainerSummary) -> Self {
-        let labels: BTreeMap<String, String> =
-            s.labels.clone().unwrap_or_default().into_iter().collect();
+        let labels: BTreeMap<String, String> = s.labels.clone().unwrap_or_default().into_iter().collect();
         let status = s.status.clone().unwrap_or_default();
         let name = s
             .names
@@ -255,12 +241,7 @@ impl Container {
         Container {
             id: s.id.clone().unwrap_or_default(),
             name,
-            image: s
-                .image
-                .clone()
-                .unwrap_or_default()
-                .trim_start_matches("sha256:")
-                .to_string(),
+            image: s.image.clone().unwrap_or_default().trim_start_matches("sha256:").to_string(),
             state: state_from(s.state.as_ref()),
             exit_code: parse_exit_code(&status),
             health: parse_health(&status),
@@ -268,9 +249,7 @@ impl Container {
             ports,
             project: labels.get(LABEL_PROJECT).cloned(),
             service: labels.get(LABEL_SERVICE).cloned(),
-            oneoff: labels
-                .get(LABEL_ONEOFF)
-                .is_some_and(|v| v.eq_ignore_ascii_case("true")),
+            oneoff: labels.get(LABEL_ONEOFF).is_some_and(|v| v.eq_ignore_ascii_case("true")),
             labels,
             created: s.created.unwrap_or_default(),
         }
@@ -286,24 +265,13 @@ impl Image {
             },
             None => ("<none>".to_string(), String::new()),
         };
-        Image {
-            id: s.id.clone(),
-            name,
-            tag,
-            size: s.size,
-            created: s.created,
-            containers: s.containers,
-        }
+        Image { id: s.id.clone(), name, tag, size: s.size, created: s.created, containers: s.containers }
     }
 }
 
 impl Volume {
     pub fn from_bollard(v: &BVolume) -> Self {
-        Volume {
-            name: v.name.clone(),
-            driver: v.driver.clone(),
-            labelled: !v.labels.is_empty(),
-        }
+        Volume { name: v.name.clone(), driver: v.driver.clone(), labelled: !v.labels.is_empty() }
     }
 }
 
@@ -319,33 +287,17 @@ impl Network {
 
 /// Containers: running, exited, created, then other states; then by name.
 pub fn sort_containers(cs: &mut [Container]) {
-    cs.sort_by(|a, b| {
-        a.state
-            .rank()
-            .cmp(&b.state.rank())
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    cs.sort_by(|a, b| a.state.rank().cmp(&b.state.rank()).then_with(|| a.name.cmp(&b.name)));
 }
 
 /// Images by name, tag, id with untagged (`<none>`) last.
 pub fn sort_images(is: &mut [Image]) {
-    is.sort_by(|a, b| {
-        (a.name == "<none>", &a.name, &a.tag, &a.id).cmp(&(
-            b.name == "<none>",
-            &b.name,
-            &b.tag,
-            &b.id,
-        ))
-    });
+    is.sort_by(|a, b| (a.name == "<none>", &a.name, &a.tag, &a.id).cmp(&(b.name == "<none>", &b.name, &b.tag, &b.id)));
 }
 
 /// Volumes with labels first, then by name.
 pub fn sort_volumes(vs: &mut [Volume]) {
-    vs.sort_by(|a, b| {
-        b.labelled
-            .cmp(&a.labelled)
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    vs.sort_by(|a, b| b.labelled.cmp(&a.labelled).then_with(|| a.name.cmp(&b.name)));
 }
 
 /// Build compose projects from container labels plus the local compose file's services.
@@ -379,24 +331,15 @@ pub fn derive_projects(containers: &[Container], local: Option<&LocalCompose>) -
             let mut services: Vec<Service> = svcs
                 .into_iter()
                 .map(|s| Service {
-                    container_id: by_key
-                        .get(&(name.as_str(), s.as_str()))
-                        .map(|c| c.id.clone()),
+                    container_id: by_key.get(&(name.as_str(), s.as_str())).map(|c| c.id.clone()),
                     name: s,
                     project: name.clone(),
                 })
                 .collect();
             services.sort_by(|a, b| {
-                a.container_id
-                    .is_none()
-                    .cmp(&b.container_id.is_none())
-                    .then_with(|| a.name.cmp(&b.name))
+                a.container_id.is_none().cmp(&b.container_id.is_none()).then_with(|| a.name.cmp(&b.name))
             });
-            Project {
-                local: local.is_some_and(|l| l.project == name),
-                name,
-                services,
-            }
+            Project { local: local.is_some_and(|l| l.project == name), name, services }
         })
         .collect();
     // Local project first, then by name.
@@ -408,11 +351,7 @@ pub fn derive_projects(containers: &[Container], local: Option<&LocalCompose>) -
 pub(crate) mod tests {
     use super::*;
 
-    pub fn container(
-        name: &str,
-        state: ContainerState,
-        project: Option<(&str, &str)>,
-    ) -> Container {
+    pub fn container(name: &str, state: ContainerState, project: Option<(&str, &str)>) -> Container {
         let mut labels = BTreeMap::new();
         if let Some((p, s)) = project {
             labels.insert(LABEL_PROJECT.into(), p.into());
@@ -440,54 +379,26 @@ pub(crate) mod tests {
         let cs = vec![
             container("demo-web-1", ContainerState::Running, Some(("demo", "web"))),
             container("demo-db-1", ContainerState::Exited, Some(("demo", "db"))),
-            container(
-                "other-api-1",
-                ContainerState::Running,
-                Some(("other", "api")),
-            ),
+            container("other-api-1", ContainerState::Running, Some(("other", "api"))),
             container("loner", ContainerState::Running, None),
         ];
-        let local = LocalCompose {
-            project: "other".into(),
-            services: vec!["api".into(), "cache".into()],
-        };
+        let local = LocalCompose { project: "other".into(), services: vec!["api".into(), "cache".into()] };
         let ps = derive_projects(&cs, Some(&local));
         let names: Vec<_> = ps.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["other", "demo"], "local project first");
-        let other: Vec<_> = ps[0]
-            .services
-            .iter()
-            .map(|s| (s.name.as_str(), s.container_id.is_some()))
-            .collect();
+        let other: Vec<_> = ps[0].services.iter().map(|s| (s.name.as_str(), s.container_id.is_some())).collect();
         assert_eq!(other, vec![("api", true), ("cache", false)]);
-        assert_eq!(
-            ps[1]
-                .services
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["db", "web"]
-        );
-        assert_eq!(
-            ps[1].services[1].container_id.as_deref(),
-            Some("demo-web-1-id-0123456789abcdef")
-        );
+        assert_eq!(ps[1].services.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["db", "web"]);
+        assert_eq!(ps[1].services[1].container_id.as_deref(), Some("demo-web-1-id-0123456789abcdef"));
     }
 
     #[test]
     fn oneoff_skipped() {
-        let mut run = container(
-            "demo-web-run-1",
-            ContainerState::Running,
-            Some(("demo", "migrate")),
-        );
+        let mut run = container("demo-web-run-1", ContainerState::Running, Some(("demo", "migrate")));
         run.oneoff = true;
         let ps = derive_projects(&[run.clone()], None);
         assert!(ps.is_empty());
-        let snap = Snapshot {
-            containers: vec![run],
-            ..Default::default()
-        };
+        let snap = Snapshot { containers: vec![run], ..Default::default() };
         assert_eq!(snap.standalone_containers().count(), 1);
     }
 
@@ -509,14 +420,8 @@ pub(crate) mod tests {
     fn status_parsing() {
         assert_eq!(parse_exit_code("Exited (137) 2 hours ago"), Some(137));
         assert_eq!(parse_exit_code("Up 2 hours"), None);
-        assert_eq!(
-            parse_health("Up 3 minutes (healthy)"),
-            Some(Health::Healthy)
-        );
-        assert_eq!(
-            parse_health("Up 3 seconds (health: starting)"),
-            Some(Health::Starting)
-        );
+        assert_eq!(parse_health("Up 3 minutes (healthy)"), Some(Health::Healthy));
+        assert_eq!(parse_health("Up 3 seconds (health: starting)"), Some(Health::Starting));
         assert_eq!(parse_health("Up 3 minutes"), None);
     }
 
@@ -534,19 +439,8 @@ pub(crate) mod tests {
             Image::from_summary(&mk("sha256:4", &["<none>:<none>"])),
         ];
         sort_images(&mut is);
-        let shown: Vec<_> = is
-            .iter()
-            .map(|i| (i.name.as_str(), i.tag.as_str()))
-            .collect();
-        assert_eq!(
-            shown,
-            vec![
-                ("localhost:5000/app", ""),
-                ("redis", "7-alpine"),
-                ("<none>", ""),
-                ("<none>", "")
-            ]
-        );
+        let shown: Vec<_> = is.iter().map(|i| (i.name.as_str(), i.tag.as_str())).collect();
+        assert_eq!(shown, vec![("localhost:5000/app", ""), ("redis", "7-alpine"), ("<none>", ""), ("<none>", "")]);
     }
 
     #[test]
@@ -568,9 +462,6 @@ pub(crate) mod tests {
         assert_eq!(c.name, "demo-web-1");
         assert_eq!(c.state, ContainerState::Exited);
         assert_eq!(c.exit_code, Some(2));
-        assert_eq!(
-            (c.project.as_deref(), c.service.as_deref(), c.oneoff),
-            (Some("demo"), Some("web"), false)
-        );
+        assert_eq!((c.project.as_deref(), c.service.as_deref(), c.oneoff), (Some("demo"), Some("web"), false));
     }
 }

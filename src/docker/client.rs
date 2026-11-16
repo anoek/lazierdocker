@@ -3,13 +3,11 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bollard::query_parameters::{
-    ListContainersOptions, ListImagesOptions, ListNetworksOptions, ListVolumesOptions,
-};
+use bollard::query_parameters::{ListContainersOptions, ListImagesOptions, ListNetworksOptions, ListVolumesOptions};
 
 use super::model::{
-    derive_projects, sort_containers, sort_images, sort_volumes, Container, Image, LocalCompose,
-    Network, Snapshot, Volume,
+    derive_projects, sort_containers, sort_images, sort_volumes, Container, Image, LocalCompose, Network, Snapshot,
+    Volume,
 };
 
 #[derive(Clone)]
@@ -25,12 +23,8 @@ impl Docker {
         match std::env::var("DOCKER_HOST") {
             Ok(host) if !host.is_empty() => Self::connect_to(&host),
             _ => {
-                let api =
-                    bollard::Docker::connect_with_defaults().context("connecting to docker")?;
-                Ok(Self {
-                    api,
-                    host: "unix:///var/run/docker.sock".into(),
-                })
+                let api = bollard::Docker::connect_with_defaults().context("connecting to docker")?;
+                Ok(Self { api, host: "unix:///var/run/docker.sock".into() })
             }
         }
     }
@@ -46,10 +40,7 @@ impl Docker {
             bollard::Docker::connect_with_defaults()
         }
         .with_context(|| format!("connecting to docker at {host}"))?;
-        Ok(Self {
-            api,
-            host: host.to_string(),
-        })
+        Ok(Self { api, host: host.to_string() })
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -58,61 +49,30 @@ impl Docker {
     }
 
     pub async fn snapshot(&self, local: Option<&LocalCompose>) -> Result<Snapshot> {
-        let containers_f = self.api.list_containers(Some(ListContainersOptions {
-            all: true,
-            ..Default::default()
-        }));
-        let images_f = self.api.list_images(Some(ListImagesOptions {
-            all: false,
-            ..Default::default()
-        }));
+        let containers_f = self.api.list_containers(Some(ListContainersOptions { all: true, ..Default::default() }));
+        let images_f = self.api.list_images(Some(ListImagesOptions { all: false, ..Default::default() }));
         let volumes_f = self.api.list_volumes(None::<ListVolumesOptions>);
         let networks_f = self.api.list_networks(None::<ListNetworksOptions>);
-        let (containers, images, volumes, networks) =
-            tokio::join!(containers_f, images_f, volumes_f, networks_f);
+        let (containers, images, volumes, networks) = tokio::join!(containers_f, images_f, volumes_f, networks_f);
 
-        let mut containers: Vec<Container> = containers
-            .context("listing containers")?
-            .iter()
-            .map(Container::from_summary)
-            .collect();
+        let mut containers: Vec<Container> =
+            containers.context("listing containers")?.iter().map(Container::from_summary).collect();
         sort_containers(&mut containers);
-        let mut images: Vec<Image> = images
-            .context("listing images")?
-            .iter()
-            .map(Image::from_summary)
-            .collect();
+        let mut images: Vec<Image> = images.context("listing images")?.iter().map(Image::from_summary).collect();
         sort_images(&mut images);
-        let mut volumes: Vec<Volume> = volumes
-            .context("listing volumes")?
-            .volumes
-            .unwrap_or_default()
-            .iter()
-            .map(Volume::from_bollard)
-            .collect();
+        let mut volumes: Vec<Volume> =
+            volumes.context("listing volumes")?.volumes.unwrap_or_default().iter().map(Volume::from_bollard).collect();
         sort_volumes(&mut volumes);
-        let mut networks: Vec<Network> = networks
-            .context("listing networks")?
-            .iter()
-            .map(Network::from_bollard)
-            .collect();
+        let mut networks: Vec<Network> =
+            networks.context("listing networks")?.iter().map(Network::from_bollard).collect();
         networks.sort_by(|a, b| a.name.cmp(&b.name));
         let projects = derive_projects(&containers, local);
-        Ok(Snapshot {
-            containers,
-            projects,
-            images,
-            volumes,
-            networks,
-        })
+        Ok(Snapshot { containers, projects, images, volumes, networks })
     }
 }
 
 /// Detect the compose project in the current directory (lazydocker: `docker compose config`).
-pub async fn detect_local_compose(
-    compose_files: &[String],
-    project: Option<&str>,
-) -> Option<LocalCompose> {
+pub async fn detect_local_compose(compose_files: &[String], project: Option<&str>) -> Option<LocalCompose> {
     let mut cmd = tokio::process::Command::new("docker");
     cmd.arg("compose");
     for f in compose_files {
@@ -122,12 +82,8 @@ pub async fn detect_local_compose(
         cmd.arg("-p").arg(p);
     }
     cmd.args(["config", "--format", "json"]);
-    cmd.stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let out = tokio::time::timeout(Duration::from_secs(10), cmd.output())
-        .await
-        .ok()?
-        .ok()?;
+    cmd.stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let out = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await.ok()?.ok()?;
     if !out.status.success() {
         return None;
     }
@@ -137,11 +93,8 @@ pub async fn detect_local_compose(
 pub fn parse_compose_config(json: &[u8]) -> Option<LocalCompose> {
     let v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let project = v.get("name")?.as_str()?.to_string();
-    let mut services: Vec<String> = v
-        .get("services")
-        .and_then(|s| s.as_object())
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
+    let mut services: Vec<String> =
+        v.get("services").and_then(|s| s.as_object()).map(|m| m.keys().cloned().collect()).unwrap_or_default();
     services.sort();
     Some(LocalCompose { project, services })
 }

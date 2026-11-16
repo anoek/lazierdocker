@@ -22,6 +22,23 @@ pub enum Action {
     Unpin(PaneId),
     Copy(String),
     Help,
+    Docker(crate::docker::ops::DockerOp),
+    /// Run an attached command in a new terminal pane.
+    RunInPane {
+        title: String,
+        argv: Vec<String>,
+    },
+    /// Ask for confirmation, then perform `action`.
+    Ask {
+        title: String,
+        body: String,
+        danger: bool,
+        action: Box<Action>,
+    },
+    Menu(Menu),
+    OpenUrl(String),
+    Flash(String),
+    Error(String),
 }
 
 impl App {
@@ -74,6 +91,28 @@ impl App {
             Action::Copy(text) => vec![Effect::Copy(text)],
             Action::Help => {
                 self.overlay = Some(Overlay::Help { filter: String::new(), scroll: 0 });
+                Vec::new()
+            }
+            Action::Docker(op) => {
+                self.pending_ops.push(op.describe());
+                vec![Effect::Docker(op)]
+            }
+            Action::RunInPane { title, argv } => self.open_terminal(title, argv),
+            Action::Ask { title, body, danger, action } => {
+                self.overlay = Some(Overlay::Confirm { title, body, danger, action: *action });
+                Vec::new()
+            }
+            Action::Menu(m) => {
+                self.open_menu(m);
+                Vec::new()
+            }
+            Action::OpenUrl(url) => vec![Effect::OpenUrl(url)],
+            Action::Flash(msg) => {
+                self.flash(msg);
+                Vec::new()
+            }
+            Action::Error(msg) => {
+                self.show_error(msg);
                 Vec::new()
             }
         }
@@ -134,12 +173,5 @@ impl App {
         }
         items.push(MenuItem::new("Close pane", Action::ClosePane(id)).key("^b x").danger());
         Menu::new(self.pane_title(id), items)
-    }
-}
-
-impl App {
-    /// Docker operations offered for an item (filled in with lazydocker's actions).
-    pub fn docker_menu_items(&self, _key: &NodeKey) -> Vec<MenuItem> {
-        Vec::new()
     }
 }

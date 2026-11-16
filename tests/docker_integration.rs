@@ -24,3 +24,18 @@ async fn snapshot_sees_demo_project() {
     assert!(snap.volumes.iter().any(|v| v.name == "demo_dbdata"));
     assert!(snap.networks.iter().any(|n| n.name == "demo_default"));
 }
+
+#[tokio::test]
+async fn restart_container_via_op() {
+    use lazierdocker::docker::ops::{run, DockerOp};
+    let Some(host) = test_host() else { return };
+    let docker = Docker::connect_to(&host).unwrap();
+    let snap = docker.snapshot(None).await.unwrap();
+    let loner = snap.containers.iter().find(|c| c.name == "loner").unwrap();
+    let before = docker.api.inspect_container(&loner.id, None).await.unwrap().state.unwrap().started_at.unwrap();
+    run(&docker, DockerOp::Restart(loner.id.clone())).await.unwrap();
+    let after = docker.api.inspect_container(&loner.id, None).await.unwrap().state.unwrap().started_at.unwrap();
+    assert_ne!(before, after);
+    // Errors come back as Err, not panics.
+    assert!(run(&docker, DockerOp::Start("no-such-container".into())).await.is_err());
+}

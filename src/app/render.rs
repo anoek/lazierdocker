@@ -244,7 +244,11 @@ impl App {
             },
         };
         let toast = self.toast.as_ref().filter(|(_, at)| at.elapsed() < std::time::Duration::from_secs(4));
+        const SPIN: [&str; 4] = ["|", "/", "-", "\\"];
         let right = match (&self.docker_error, toast) {
+            _ if !self.pending_ops.is_empty() => {
+                Some((format!("{} {}…", SPIN[(self.tick % 4) as usize], self.pending_ops.join(", ")), false))
+            }
             (_, Some((msg, _))) => Some((format!("● {msg}"), false)),
             (Some(e), None) => Some((format!("⚠ {e}"), true)),
             (None, None) => Some((self.host.clone(), false)),

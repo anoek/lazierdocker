@@ -89,6 +89,7 @@ pub async fn run(opts: Options) -> Result<()> {
     };
 
     let mut app = App::new(docker.host.clone());
+    app.compose_files = opts.compose_files.clone();
     let mut term = setup_terminal()?;
     let size = term.size()?;
     app.size = (size.width, size.height);
@@ -160,6 +161,28 @@ impl Runtime {
         match effect {
             Effect::Quit => app.quit = true,
             Effect::RefreshNow => self.refresher.poke(),
+            Effect::Docker(op) => {
+                let docker = self.docker.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let desc = op.describe();
+                    let result = crate::docker::ops::run(&docker, op.clone()).await.map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(AppEvent::OpDone { op, desc, result });
+                });
+            }
+            Effect::OpenUrl(url) => {
+                let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                let spawned = std::process::Command::new(opener)
+                    .arg(&url)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                match spawned {
+                    Ok(_) => app.flash(format!("opened {url}")),
+                    Err(e) => app.show_error(format!("could not open {url}: {e}")),
+                }
+            }
             Effect::Copy(text) => {
                 let how = crate::clipboard::copy(&text);
                 let n = text.chars().count();

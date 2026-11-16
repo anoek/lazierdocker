@@ -21,6 +21,8 @@ pub enum AppEvent {
     TermExited(PaneId, u64, Option<u32>),
     /// A container log stream ended.
     LogsEnded(PaneId, ContentKey),
+    /// A docker operation finished.
+    OpDone { op: crate::docker::ops::DockerOp, desc: String, result: Result<Option<String>, String> },
     /// One stats sample for a container.
     Stats(String, StatsSample),
 }

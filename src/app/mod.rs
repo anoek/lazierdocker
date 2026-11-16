@@ -5,6 +5,7 @@
 //! as [`AppEvent`]s.
 
 pub mod actions;
+pub mod docker_actions;
 pub mod input;
 pub mod inspect;
 pub mod loader;
@@ -96,6 +97,8 @@ pub enum Effect {
     SyncStats(Vec<String>),
     /// Put text on the system clipboard.
     Copy(String),
+    Docker(crate::docker::ops::DockerOp),
+    OpenUrl(String),
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +183,10 @@ pub struct App {
     /// Transient status message.
     pub toast: Option<(String, Instant)>,
     pub overlay: Option<overlay::Overlay>,
+    /// Running docker operations (status bar).
+    pub pending_ops: Vec<String>,
+    /// Compose files given on the command line (local project).
+    pub compose_files: Vec<String>,
     pub overlay_hits: overlay::OverlayHits,
     pub size: (u16, u16),
     pub dirty: bool,
@@ -216,6 +223,8 @@ impl App {
             cursor: None,
             toast: None,
             overlay: None,
+            pending_ops: Vec::new(),
+            compose_files: Vec::new(),
             overlay_hits: overlay::OverlayHits::default(),
             size: (80, 24),
             dirty: true,
@@ -283,6 +292,35 @@ impl App {
                         self.dirty = true;
                     }
                 }
+            }
+            AppEvent::OpDone { op, desc, result } => {
+                if let Some(i) = self.pending_ops.iter().position(|d| *d == desc) {
+                    self.pending_ops.remove(i);
+                }
+                self.dirty = true;
+                match result {
+                    Ok(Some(msg)) => self.flash(msg),
+                    Ok(None) => self.flash(format!("done: {desc}")),
+                    Err(e) => match op {
+                        crate::docker::ops::DockerOp::RemoveContainer { id, volumes, force: false }
+                            if crate::docker::ops::is_must_stop(&e) =>
+                        {
+                            let name = self.snap.container(&id).map(|c| c.name.clone()).unwrap_or(id.clone());
+                            self.overlay = Some(overlay::Overlay::Confirm {
+                                title: "Force remove".into(),
+                                body: format!("{name} is running. Stop and remove it?"),
+                                danger: true,
+                                action: actions::Action::Docker(crate::docker::ops::DockerOp::RemoveContainer {
+                                    id,
+                                    volumes,
+                                    force: true,
+                                }),
+                            });
+                        }
+                        _ => self.show_error(e),
+                    },
+                }
+                return vec![Effect::RefreshNow];
             }
             AppEvent::Stats(id, sample) => {
                 self.cpu.insert(id.clone(), sample.cpu_percent());

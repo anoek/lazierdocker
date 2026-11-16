@@ -586,3 +586,168 @@ mod overlays {
         assert!(app.overlay.is_none());
     }
 }
+
+mod docker_actions {
+    use super::*;
+    use crate::app::actions::Action;
+    use crate::app::overlay::Overlay;
+    use crate::docker::ops::DockerOp;
+
+    fn select(app: &mut App, key: NodeKey) {
+        let rows = app.rows().to_vec();
+        app.sidebar.select(&rows, &key);
+    }
+
+    fn loner(app: &App) -> String {
+        app.snap.containers.iter().find(|c| c.name == "loner").unwrap().id.clone()
+    }
+
+    fn local_app() -> App {
+        let mut app = App::new("tcp://test");
+        let mut snap = demo_snapshot();
+        snap.projects[0].local = true;
+        app.compose_files = vec!["compose.yml".into()];
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snap)));
+        app
+    }
+
+    #[test]
+    fn stop_requires_confirm() {
+        let mut app = loaded_app();
+        let id = loner(&app);
+        select(&mut app, NodeKey::Container(id.clone()));
+        assert!(app.handle_key(key(KeyCode::Char('s'))).is_empty());
+        assert!(matches!(&app.overlay, Some(Overlay::Confirm { .. })));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Effect::Docker(DockerOp::Stop(id.clone()))]);
+        assert_eq!(app.pending_ops, vec!["stopping"]);
+        // Restart has no confirmation (lazydocker).
+        assert_eq!(app.handle_key(key(KeyCode::Char('r'))), vec![Effect::Docker(DockerOp::Restart(id))]);
+    }
+
+    #[test]
+    fn remove_menu_items() {
+        let mut app = loaded_app();
+        let id = loner(&app);
+        select(&mut app, NodeKey::Container(id.clone()));
+        app.handle_key(key(KeyCode::Char('d')));
+        let Some(Overlay::Menu(m)) = &app.overlay else { panic!("{:?}", app.overlay) };
+        let labels: Vec<_> = m.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["remove", "remove with volumes"]);
+        assert!(m.items.iter().all(|i| i.danger));
+        assert_eq!(m.items[1].action, Action::Docker(DockerOp::RemoveContainer { id, force: false, volumes: true }));
+    }
+
+    #[test]
+    fn running_container_remove_offers_force() {
+        let mut app = loaded_app();
+        let id = loner(&app);
+        let op = DockerOp::RemoveContainer { id: id.clone(), force: false, volumes: false };
+        let fx = app.handle_app_event(AppEvent::OpDone {
+            op,
+            desc: "removing".into(),
+            result: Err(
+                "cannot remove container: container is running: stop the container before removing or force remove"
+                    .into(),
+            ),
+        });
+        assert_eq!(fx, vec![Effect::RefreshNow]);
+        let Some(Overlay::Confirm { action, danger: true, .. }) = &app.overlay else { panic!("{:?}", app.overlay) };
+        assert_eq!(*action, Action::Docker(DockerOp::RemoveContainer { id, force: true, volumes: false }));
+        // Other errors show an error popup.
+        app.overlay = None;
+        app.handle_app_event(AppEvent::OpDone {
+            op: DockerOp::Start("x".into()),
+            desc: "starting".into(),
+            result: Err("boom".into()),
+        });
+        assert!(matches!(&app.overlay, Some(Overlay::Message { error: true, body, .. }) if body == "boom"));
+    }
+
+    #[test]
+    fn compose_cmd_includes_project() {
+        let mut app = local_app();
+        select(&mut app, NodeKey::Service("demo".into(), "web".into()));
+        let fx = app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(
+            fx,
+            vec![Effect::Docker(DockerOp::Cli(
+                ["docker", "compose", "-f", "compose.yml", "-p", "demo", "up", "-d", "web"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            ))]
+        );
+    }
+
+    #[test]
+    fn non_local_project_uses_labels_or_errors() {
+        let mut app = loaded_app();
+        select(&mut app, NodeKey::Service("demo".into(), "web".into()));
+        // No compose files known: stop falls back to the container (lazydocker).
+        app.handle_key(key(KeyCode::Char('s')));
+        let Some(Overlay::Confirm { action: Action::Docker(DockerOp::Stop(id)), .. }) = &app.overlay else {
+            panic!("{:?}", app.overlay)
+        };
+        assert!(id.starts_with("demo-web-1"));
+        app.overlay = None;
+        // ...and compose-file operations explain why they can't run.
+        app.handle_key(key(KeyCode::Char('u')));
+        assert!(matches!(&app.overlay, Some(Overlay::Message { error: true, .. })));
+        // With labels pointing at the files, compose works.
+        let mut snap = demo_snapshot();
+        for c in &mut snap.containers {
+            c.labels.insert("com.docker.compose.project.config_files".into(), "/srv/demo/compose.yml".into());
+            c.labels.insert("com.docker.compose.project.working_dir".into(), "/srv/demo".into());
+        }
+        app.handle_app_event(AppEvent::Snapshot(Box::new(snap)));
+        app.overlay = None;
+        let fx = app.handle_key(key(KeyCode::Char('u')));
+        let Some(Effect::Docker(DockerOp::Cli(argv))) = fx.first() else { panic!("{fx:?}") };
+        assert_eq!(
+            argv.join(" "),
+            "docker compose -f /srv/demo/compose.yml --project-directory /srv/demo -p demo up -d web"
+        );
+    }
+
+    #[test]
+    fn bulk_service_menu_matches_lazydocker() {
+        let app = local_app();
+        let m = app.bulk_services_menu("demo");
+        let labels: Vec<_> = m.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "up",
+                "up (attached)",
+                "stop",
+                "pull",
+                "build",
+                "down",
+                "down with volumes",
+                "down and remove images",
+                "down with volumes and remove images"
+            ]
+        );
+        assert!(matches!(&m.items[1].action, Action::RunInPane { .. }), "attached commands run in a pane");
+    }
+
+    #[test]
+    fn prune_asks_first() {
+        let mut app = loaded_app();
+        select(&mut app, NodeKey::Section(crate::ui::sidebar::Section::Images));
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Enter));
+        let Some(Overlay::Confirm { action, danger: true, .. }) = &app.overlay else { panic!("{:?}", app.overlay) };
+        assert_eq!(*action, Action::Docker(DockerOp::PruneImages));
+    }
+
+    #[test]
+    fn context_menu_lists_docker_actions() {
+        let app = loaded_app();
+        let m = app.item_menu(&NodeKey::Container(loner(&app)));
+        let labels: Vec<_> = m.items.iter().map(|i| i.label.as_str()).collect();
+        for want in ["Stop", "Restart", "Remove…", "Bulk…", "Exec shell"] {
+            assert!(labels.contains(&want), "{labels:?}");
+        }
+    }
+}

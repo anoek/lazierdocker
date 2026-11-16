@@ -233,7 +233,7 @@ impl App {
                 self.open_logs(target.clone());
                 Vec::new()
             }
-            _ => Vec::new(),
+            _ => self.docker_key(c, target).unwrap_or_default(),
         }
     }
 

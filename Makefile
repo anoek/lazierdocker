@@ -19,8 +19,10 @@ CARGO   ?= cargo
 ARGS    ?=
 CHROMIUM ?= chromium
 
-BIN    := lazierdocker
-TARGET := target/release/$(BIN)
+BIN     := lazierdocker
+TARGET  := target/release/$(BIN)
+# What the release binary is built from: it is rebuilt when any is newer.
+SOURCES := Cargo.toml Cargo.lock $(shell find src -name '*.rs')
 
 # rustup and our Zig live in the user's home and may not be on PATH.
 export PATH := $(HOME)/.cargo/bin:$(HOME)/.local/bin:$(PATH)
@@ -35,10 +37,15 @@ build:
 run: build
 	./$(TARGET) $(ARGS)
 
-$(TARGET):
+# cargo leaves the binary alone when nothing it uses changed; touch it so
+# make sees it as up to date.
+$(TARGET): $(SOURCES)
 	$(CARGO) build --release
+	@touch $@
 
-# Depends on the binary, not on `build`: under sudo, cargo would build as root.
+# Builds the binary when it is missing or older than its sources. After a
+# plain `make`, `sudo make install` finds it up to date and never runs cargo
+# as root.
 install: $(TARGET)
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -m 0755 "$(TARGET)" "$(DESTDIR)$(BINDIR)/$(BIN)"

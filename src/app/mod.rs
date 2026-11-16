@@ -7,6 +7,7 @@
 pub mod input;
 pub mod inspect;
 pub mod loader;
+pub mod panes;
 pub mod render;
 pub mod run;
 
@@ -42,7 +43,14 @@ pub enum Mode {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Drag {
     SidebarWidth,
-    Split { path: Vec<bool>, dir: SplitDir, area: Rect, grab_offset: i32 },
+    Split {
+        path: Vec<bool>,
+        dir: SplitDir,
+        area: Rect,
+        grab_offset: i32,
+    },
+    /// Mouse gesture forwarded to a terminal pane's program.
+    TermMouse(PaneId),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -165,6 +173,8 @@ pub struct App {
     pub tick: u64,
     /// Cursor to show (focused terminal pane).
     pub cursor: Option<(u16, u16)>,
+    /// Transient status message.
+    pub toast: Option<(String, Instant)>,
     pub size: (u16, u16),
     pub dirty: bool,
     pub quit: bool,
@@ -198,6 +208,7 @@ impl App {
             stats: HashMap::new(),
             tick: 0,
             cursor: None,
+            toast: None,
             size: (80, 24),
             dirty: true,
             quit: false,
@@ -244,8 +255,10 @@ impl App {
     pub fn handle_app_event(&mut self, ev: AppEvent) -> Vec<Effect> {
         match ev {
             AppEvent::TermActivity(_) => self.dirty = true,
-            AppEvent::TermExited(pane, code) => {
-                if let Some(Pane { content: Content::Term(t), kind, .. }) = self.panes.get_mut(&pane) {
+            AppEvent::TermExited(pane, sid, code) => {
+                if let Some(Pane { content: Content::Term(t), kind, .. }) =
+                    self.panes.get_mut(&pane).filter(|p| matches!(&p.content, Content::Term(t) if t.id() == sid))
+                {
                     let what =
                         if matches!(kind, PaneKind::Terminal { .. }) { "process exited" } else { "stream ended" };
                     match code {

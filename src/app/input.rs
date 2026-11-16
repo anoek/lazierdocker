@@ -36,8 +36,25 @@ impl App {
         if self.mode == Mode::Filter {
             self.sidebar.filter.push_str(text.lines().next().unwrap_or(""));
             self.rebuild_rows();
+        } else if let Some(t) = self.focused_live_terminal() {
+            t.paste(&text);
         }
         Vec::new()
+    }
+
+    /// The focused pane's terminal when it is interactive and its child is alive.
+    pub fn focused_live_terminal(&mut self) -> Option<&mut crate::term::TermSurface> {
+        if self.focus != Focus::Panes {
+            return None;
+        }
+        match self.panes.get_mut(&self.layout.focus) {
+            Some(super::Pane { kind: super::PaneKind::Terminal { .. }, content: super::Content::Term(t), .. })
+                if t.exited().is_none() =>
+            {
+                Some(t)
+            }
+            _ => None,
+        }
     }
 
     pub fn handle_key(&mut self, k: KeyEvent) -> Vec<Effect> {
@@ -52,6 +69,10 @@ impl App {
         }
         if is_prefix(&k) {
             self.mode = Mode::Prefix;
+            return Vec::new();
+        }
+        if let Some(t) = self.focused_live_terminal() {
+            t.send_key(&k);
             return Vec::new();
         }
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
@@ -78,9 +99,32 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.focus_dir(area, Dir4::Up),
             KeyCode::Char('j') | KeyCode::Down => self.focus_dir(area, Dir4::Down),
             KeyCode::Char('z') => self.layout.toggle_zoom(),
+            KeyCode::Char('v') | KeyCode::Char('%') => self.split_focused(SplitDir::Horizontal),
+            KeyCode::Char('-') | KeyCode::Char('"') => self.split_focused(SplitDir::Vertical),
+            KeyCode::Char('x') => self.close_pane(self.layout.focus),
+            KeyCode::Char('o') | KeyCode::Tab => self.focus_next_pane(1),
+            KeyCode::BackTab => self.focus_next_pane(-1),
+            KeyCode::Char('H') => self.swap_dir(area, Dir4::Left),
+            KeyCode::Char('L') => self.swap_dir(area, Dir4::Right),
+            KeyCode::Char('K') => self.swap_dir(area, Dir4::Up),
+            KeyCode::Char('J') => self.swap_dir(area, Dir4::Down),
+            // ctrl+b twice sends a literal ctrl+b to a terminal pane.
+            KeyCode::Char('b') => {
+                if let Some(t) = self.focused_live_terminal() {
+                    t.send_key(&k);
+                }
+            }
             _ => {}
         }
         Vec::new()
+    }
+
+    fn swap_dir(&mut self, area: Rect, dir: Dir4) {
+        if let Some(other) = self.layout.neighbour(area, self.layout.focus, dir) {
+            let me = self.layout.focus;
+            self.layout.swap(me, other);
+            self.layout.focus = me;
+        }
     }
 
     fn focus_dir(&mut self, area: Rect, dir: Dir4) {
@@ -162,6 +206,11 @@ impl App {
                 let rows = self.rows.clone();
                 self.sidebar.select(&rows, &key);
             }
+            KeyCode::Char(c) => {
+                if let Some(target) = self.sidebar.selected.clone() {
+                    return self.item_key(c, &target);
+                }
+            }
             _ => {}
         }
         let h = self.hits.sidebar.list_area.height as usize;
@@ -169,9 +218,29 @@ impl App {
         Vec::new()
     }
 
+    /// Per-item lazydocker keys, from the sidebar or a pane showing the item.
+    pub fn item_key(&mut self, c: char, target: &NodeKey) -> Vec<Effect> {
+        match c {
+            'E' => self.exec_shell(target),
+            'a' => self.attach(target),
+            'm' => {
+                self.open_logs(target.clone());
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn pane_key(&mut self, k: KeyEvent) -> Vec<Effect> {
         let id = self.layout.focus;
         let page = self.hits.content.iter().find(|(p, _)| *p == id).map(|(_, r)| r.height.max(1) as i32).unwrap_or(10);
+        // A finished terminal pane: any of these closes it.
+        if matches!(self.panes.get(&id).map(|p| &p.kind), Some(super::PaneKind::Terminal { .. }))
+            && matches!(k.code, KeyCode::Char('q') | KeyCode::Char('x') | KeyCode::Enter | KeyCode::Esc)
+        {
+            self.close_pane(id);
+            return Vec::new();
+        }
         match k.code {
             KeyCode::Char('q') => return vec![Effect::Quit],
             KeyCode::Esc | KeyCode::BackTab | KeyCode::Tab => {
@@ -187,11 +256,26 @@ impl App {
             KeyCode::PageUp | KeyCode::Char('K') => self.scroll_pane(id, -page),
             KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_pane(id, page / 2),
             KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_pane(id, -page / 2),
-            KeyCode::Home | KeyCode::Char('g') => self.scroll_pane(id, i32::MIN / 2),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll_pane_top(id),
             KeyCode::End | KeyCode::Char('G') => self.scroll_pane_end(id),
+            KeyCode::Char(c) => {
+                if let Some(target) = self.pane_target(id) {
+                    return self.item_key(c, &target);
+                }
+            }
             _ => {}
         }
         Vec::new()
+    }
+
+    fn scroll_pane_top(&mut self, id: crate::ui::layout::PaneId) {
+        if let Some(p) = self.panes.get_mut(&id) {
+            match &mut p.content {
+                super::Content::Doc(d) => d.scroll_top(),
+                super::Content::Term(t) => t.scroll_to_top(),
+            }
+            self.dirty = true;
+        }
     }
 
     /// The pane `[`/`]` act on from the sidebar: the focused pane if it is an
@@ -278,6 +362,20 @@ impl App {
     pub fn handle_mouse(&mut self, m: MouseEvent) -> Vec<Effect> {
         let (col, row) = (m.column, m.row);
         // Active drags take every event until release.
+        if let Some(Drag::TermMouse(pane)) = self.drag.clone() {
+            let action = match m.kind {
+                MouseEventKind::Drag(_) => Some(ghostty_vt::MOUSE_ACTION_MOTION),
+                MouseEventKind::Up(_) => Some(ghostty_vt::MOUSE_ACTION_RELEASE),
+                _ => None,
+            };
+            if let Some(action) = action {
+                self.forward_mouse(pane, action, col, row);
+                if action == ghostty_vt::MOUSE_ACTION_RELEASE {
+                    self.drag = None;
+                }
+                return Vec::new();
+            }
+        }
         if let Some(drag) = self.drag.clone() {
             match m.kind {
                 MouseEventKind::Drag(MouseButton::Left) => {
@@ -302,8 +400,31 @@ impl App {
         }
     }
 
+    /// Content-relative cell for a pane, clamped into its content rect.
+    fn content_cell(&self, pane: crate::ui::layout::PaneId, col: u16, row: u16) -> Option<(u16, u16)> {
+        let (_, r) = self.hits.content.iter().find(|(p, _)| *p == pane)?;
+        if r.width == 0 || r.height == 0 {
+            return None;
+        }
+        Some((col.clamp(r.x, r.right() - 1) - r.x, row.clamp(r.y, r.bottom() - 1) - r.y))
+    }
+
+    fn forward_mouse(
+        &mut self,
+        pane: crate::ui::layout::PaneId,
+        action: ghostty_vt::ffi::GhosttyMouseAction,
+        col: u16,
+        row: u16,
+    ) {
+        let Some((x, y)) = self.content_cell(pane, col, row) else { return };
+        if let Some(super::Pane { content: super::Content::Term(t), .. }) = self.panes.get_mut(&pane) {
+            t.send_mouse(action, Some(ghostty_vt::MOUSE_BUTTON_LEFT), 0, x, y);
+        }
+    }
+
     fn apply_drag(&mut self, drag: &Drag, col: u16, row: u16) {
         match drag {
+            Drag::TermMouse(_) => {}
             Drag::SidebarWidth => {
                 let max = MAX_WIDTH.min(self.size.0.saturating_sub(20)).max(MIN_WIDTH);
                 self.sidebar.width = (col + 1).clamp(MIN_WIDTH, max);
@@ -363,6 +484,17 @@ impl App {
             });
             return Vec::new();
         }
+        // Terminal panes whose program asked for the mouse get the click.
+        if let Some((pane, _)) = self.hits.content.iter().find(|(_, r)| contains(*r, col, row)).copied() {
+            let tracking = matches!(self.panes.get(&pane), Some(super::Pane { content: super::Content::Term(t), .. }) if t.mouse_tracking());
+            if tracking {
+                self.focus = Focus::Panes;
+                self.layout.focus = pane;
+                self.forward_mouse(pane, ghostty_vt::MOUSE_ACTION_PRESS, col, row);
+                self.drag = Some(Drag::TermMouse(pane));
+                return Vec::new();
+            }
+        }
         if let Some((_, id, tab)) = self.hits.tabs.iter().find(|(r, _, _)| contains(*r, col, row)).cloned() {
             self.focus = Focus::Panes;
             self.layout.focus = id;
@@ -384,7 +516,14 @@ impl App {
             return Vec::new();
         }
         if let Some((id, _, _)) = self.hits.panes.iter().find(|(_, r, _)| contains(*r, col, row)).cloned() {
-            self.scroll_pane(id, delta);
+            let cell = self.content_cell(id, col, row).unwrap_or((0, 0));
+            match self.panes.get_mut(&id).map(|p| &mut p.content) {
+                Some(super::Content::Term(t)) => {
+                    t.wheel(delta, cell.0, cell.1);
+                    self.dirty = true;
+                }
+                _ => self.scroll_pane(id, delta),
+            }
         }
         Vec::new()
     }

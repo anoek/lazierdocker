@@ -116,6 +116,7 @@ pub async fn run(opts: Options) -> Result<()> {
                 _ = tokio::time::sleep(wait) => Vec::new(),
                 _ = ticker.tick() => {
                     app.tick += 1;
+                    app.dirty = true;
                     Vec::new()
                 }
             };
@@ -200,8 +201,8 @@ impl Runtime {
             Effect::SpawnTerm { pane, key, argv } => {
                 let (cols, rows) = app.content_size(pane);
                 let tx = self.tx.clone();
-                let on_exit = Arc::new(move |code| {
-                    let _ = tx.send(AppEvent::TermExited(pane, code));
+                let on_exit = Arc::new(move |sid, code| {
+                    let _ = tx.send(AppEvent::TermExited(pane, sid, code));
                 });
                 let env = [("DOCKER_HOST".to_string(), self.docker.host.clone())];
                 let content = match TermSurface::spawn(&argv, &env, cols, rows, self.wake_for(pane), on_exit) {

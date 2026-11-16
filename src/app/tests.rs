@@ -329,3 +329,153 @@ mod streams {
         assert_eq!(stats_lines(None, false, 60, &t).len(), 1);
     }
 }
+
+mod windows {
+    use super::*;
+    use crate::app::inspect::Tab;
+    use crate::ui::layout::SplitDir;
+
+    fn prefix(app: &mut App, c: char) -> Vec<Effect> {
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char(c)))
+    }
+
+    fn select_loner(app: &mut App) -> NodeKey {
+        let id = app.snap.containers.iter().find(|c| c.name == "loner").unwrap().id.clone();
+        let k = NodeKey::Container(id);
+        let rows = app.rows().to_vec();
+        app.sidebar.select(&rows, &k);
+        k
+    }
+
+    #[test]
+    fn prefix_split_creates_pinned_pane() {
+        let mut app = loaded_app();
+        let k = select_loner(&mut app);
+        draw(&mut app, 120, 30);
+        prefix(&mut app, 'v');
+        assert_eq!(app.layout.panes().len(), 2);
+        let new = app.layout.focus;
+        assert!(matches!(&app.panes[&new].kind, PaneKind::Pinned(p) if *p == k));
+        assert_eq!(app.focus, Focus::Panes);
+        let s = screen(&draw(&mut app, 120, 30));
+        assert!(s.contains("◆ loner"), "{s}");
+        prefix(&mut app, '-');
+        assert_eq!(app.layout.splits(app.hits.pane_area).iter().filter(|s| s.dir == SplitDir::Vertical).count(), 1);
+    }
+
+    #[test]
+    fn close_last_pane_restores_inspector() {
+        let mut app = loaded_app();
+        select_loner(&mut app);
+        draw(&mut app, 120, 30);
+        prefix(&mut app, 'v');
+        let pinned = app.layout.focus;
+        prefix(&mut app, 'h');
+        let first = app.layout.focus;
+        prefix(&mut app, 'x');
+        assert_eq!(app.layout.panes(), vec![pinned]);
+        prefix(&mut app, 'x');
+        assert_eq!(app.layout.panes(), vec![pinned]);
+        assert!(matches!(app.panes[&pinned].kind, PaneKind::Inspector), "last pane becomes inspector");
+        assert!(!app.panes.contains_key(&first));
+    }
+
+    #[test]
+    fn drag_border_updates_ratio() {
+        let mut app = loaded_app();
+        select_loner(&mut app);
+        draw(&mut app, 120, 30);
+        prefix(&mut app, 'v');
+        draw(&mut app, 120, 30);
+        let split = app.hits.splits[0].clone();
+        let y = split.area.y + 3;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), split.pos, y));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), split.pos + 10, y));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), split.pos + 10, y));
+        draw(&mut app, 120, 30);
+        assert_eq!(app.hits.splits[0].pos, split.pos + 10);
+        // Dragging far beyond clamps at 90%.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), split.pos + 10, y));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 500, y));
+        draw(&mut app, 120, 30);
+        let s = &app.hits.splits[0];
+        assert_eq!(s.pos, s.area.x + (s.area.width as f32 * 0.9).round() as u16);
+    }
+
+    #[test]
+    fn exec_opens_terminal_pane_with_login_shell() {
+        let mut app = loaded_app();
+        let k = select_loner(&mut app);
+        draw(&mut app, 120, 30);
+        let effects = app.handle_key(key(KeyCode::Char('E')));
+        let Some(Effect::SpawnTerm { argv, key: None, pane }) = effects.first() else { panic!("{effects:?}") };
+        assert_eq!(&argv[..3], &["docker", "exec", "-it"]);
+        assert!(argv.last().unwrap().contains("/etc/passwd"));
+        assert!(matches!(&app.panes[pane].kind, PaneKind::Terminal { title } if title == "exec loner"));
+        // Exited containers can't be exec'd into.
+        let exited = app.snap.containers.iter().find(|c| c.name == "exited").unwrap().id.clone();
+        assert!(app.exec_shell(&NodeKey::Container(exited)).is_empty());
+        assert!(app.toast.is_some());
+        let _ = k;
+    }
+
+    #[test]
+    fn m_opens_logs_pane() {
+        let mut app = loaded_app();
+        select_loner(&mut app);
+        draw(&mut app, 120, 30);
+        app.handle_key(key(KeyCode::Char('m')));
+        let id = app.layout.focus;
+        assert_eq!(app.pane_tab(id), Some(Tab::Logs));
+        assert!(app.sync_panes().iter().any(|e| matches!(e, Effect::StartLogs { pane, .. } if *pane == id)));
+    }
+
+    #[test]
+    fn keys_forwarded_to_terminal() {
+        let mut app = loaded_app();
+        draw(&mut app, 120, 30);
+        let id = app.open_pane(PaneKind::Terminal { title: "cat".into() }, None);
+        let t = crate::term::TermSurface::spawn(
+            &["cat".into()],
+            &[],
+            40,
+            10,
+            std::sync::Arc::new(|| {}),
+            std::sync::Arc::new(|_, _| {}),
+        )
+        .unwrap();
+        app.panes.get_mut(&id).unwrap().content = Content::Term(t);
+        // 'q' goes to cat, not quit; ctrl-c goes to cat too.
+        assert!(app.handle_key(key(KeyCode::Char('q'))).is_empty());
+        app.handle_key(key(KeyCode::Enter));
+        let ok = (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            matches!(&app.panes[&id].content, Content::Term(t) if t.viewport_text().iter().filter(|l| l.starts_with('q')).count() >= 2)
+        });
+        assert!(ok);
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)).is_empty());
+        // The prefix still works.
+        prefix(&mut app, 'h');
+        assert_ne!(app.layout.focus, id);
+    }
+}
+
+mod exits {
+    use super::*;
+
+    #[test]
+    fn stale_exit_does_not_mark_new_surface() {
+        let mut app = loaded_app();
+        let pane = app.layout.focus;
+        let t = crate::term::TermSurface::stream(20, 3, std::sync::Arc::new(|| {})).unwrap();
+        let sid = t.id();
+        app.panes.get_mut(&pane).unwrap().content = Content::Term(t);
+        app.handle_app_event(AppEvent::TermExited(pane, sid + 1000, Some(1)));
+        let Content::Term(t) = &app.panes[&pane].content else { panic!() };
+        assert!(!t.viewport_text().join("").contains("ended"), "stale exit ignored");
+        app.handle_app_event(AppEvent::TermExited(pane, sid, Some(1)));
+        let Content::Term(t) = &app.panes[&pane].content else { panic!() };
+        assert!(t.viewport_text().join("").contains("code 1"));
+    }
+}

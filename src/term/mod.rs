@@ -19,7 +19,10 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 pub const SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
 
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
-pub type OnExit = Arc<dyn Fn(Option<u32>) + Send + Sync>;
+/// Called with (surface id, exit code) when the child exits.
+pub type OnExit = Arc<dyn Fn(u64, Option<u32>) + Send + Sync>;
+
+static NEXT_SURFACE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub(crate) struct Core {
     pub term: Terminal,
@@ -80,6 +83,7 @@ pub struct TermSurface {
     pending: Arc<AtomicBool>,
     wake: Wake,
     size: (u16, u16),
+    id: u64,
 }
 
 impl std::fmt::Debug for TermSurface {
@@ -119,6 +123,7 @@ impl TermSurface {
             pending: Arc::new(AtomicBool::new(false)),
             wake,
             size: (cols, rows),
+            id: NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -190,10 +195,11 @@ impl TermSurface {
         // Reaper.
         {
             let exit = me.exit.clone();
+            let sid = me.id;
             std::thread::Builder::new().name("pty-wait".into()).spawn(move || {
                 let code = child.wait().ok().map(|s| s.exit_code());
                 *exit.lock().expect("exit") = Some(code);
-                on_exit(code);
+                on_exit(sid, code);
             })?;
         }
         Ok(me)
@@ -201,6 +207,11 @@ impl TermSurface {
 
     pub fn feeder(&self, lf_to_crlf: bool) -> Feeder {
         Feeder { core: self.core.clone(), pending: self.pending.clone(), wake: self.wake.clone(), lf_to_crlf }
+    }
+
+    /// Unique identity of this surface (distinguishes replaced content).
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn is_pty(&self) -> bool {
@@ -426,7 +437,7 @@ mod tests {
             40,
             5,
             nop_wake(),
-            Arc::new(|_| {}),
+            Arc::new(|_, _| {}),
         )
         .unwrap();
         assert!(
@@ -446,7 +457,7 @@ mod tests {
             20,
             5,
             nop_wake(),
-            Arc::new(move |c| *e2.lock().unwrap() = Some(c)),
+            Arc::new(move |_, c| *e2.lock().unwrap() = Some(c)),
         )
         .unwrap();
         assert!(wait_for(|| t.exited().is_some()));
@@ -456,7 +467,7 @@ mod tests {
 
     #[test]
     fn keys_reach_child() {
-        let mut t = TermSurface::spawn(&["cat".into()], &[], 30, 5, nop_wake(), Arc::new(|_| {})).unwrap();
+        let mut t = TermSurface::spawn(&["cat".into()], &[], 30, 5, nop_wake(), Arc::new(|_, _| {})).unwrap();
         for c in "ping".chars() {
             t.send_key(&CtKey::new(crossterm::event::KeyCode::Char(c), crossterm::event::KeyModifiers::NONE));
         }
@@ -476,7 +487,7 @@ mod tests {
             30,
             5,
             nop_wake(),
-            Arc::new(|_| {}),
+            Arc::new(|_, _| {}),
         )
         .unwrap();
         t.resize(50, 7);

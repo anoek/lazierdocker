@@ -93,7 +93,7 @@ impl App {
                 Some(key) => self.target_label(key),
                 None => "inspector".into(),
             },
-            Some(PaneKind::Pinned(key)) => format!("📌 {}", self.target_label(key)),
+            Some(PaneKind::Pinned(key)) => format!("◆ {}", self.target_label(key)),
             Some(PaneKind::Terminal { title }) => match self.panes.get(&id).map(|p| &p.content) {
                 Some(Content::Term(t)) if t.exited().is_some() => format!("{title} (exited)"),
                 _ => title.clone(),
@@ -217,12 +217,36 @@ impl App {
                         ("q", "quit"),
                     ],
                 ),
-                Focus::Panes => (None, &[("tab", "sidebar"), ("^b", "window"), ("q", "quit")]),
+                Focus::Panes
+                    if matches!(
+                        self.panes.get(&self.layout.focus).map(|p| &p.kind),
+                        Some(PaneKind::Terminal { .. })
+                    ) =>
+                {
+                    (
+                        Some(("TERMINAL", t.green)),
+                        &[("^b", "window"), ("^b x", "close"), ("^b h", "← focus"), ("^b z", "zoom")],
+                    )
+                }
+                Focus::Panes => (
+                    None,
+                    &[
+                        ("tab", "sidebar"),
+                        ("[ ]", "tabs"),
+                        ("j/k", "scroll"),
+                        ("m", "logs pane"),
+                        ("E", "exec"),
+                        ("^b", "window"),
+                        ("q", "quit"),
+                    ],
+                ),
             },
         };
-        let right = match &self.docker_error {
-            Some(e) => Some((format!("⚠ {e}"), true)),
-            None => Some((self.host.clone(), false)),
+        let toast = self.toast.as_ref().filter(|(_, at)| at.elapsed() < std::time::Duration::from_secs(4));
+        let right = match (&self.docker_error, toast) {
+            (_, Some((msg, _))) => Some((format!("● {msg}"), false)),
+            (Some(e), None) => Some((format!("⚠ {e}"), true)),
+            (None, None) => Some((self.host.clone(), false)),
         };
         statusbar::render(buf, area, &Status { pill, hints, right }, &t);
     }

@@ -17,8 +17,8 @@ pub enum AppEvent {
     Doc { pane: PaneId, key: ContentKey, lines: Vec<Line<'static>> },
     /// A terminal surface produced output.
     TermActivity(PaneId),
-    /// A terminal pane's child process exited.
-    TermExited(PaneId, Option<u32>),
+    /// A terminal surface's child process exited: (pane, surface id, code).
+    TermExited(PaneId, u64, Option<u32>),
     /// A container log stream ended.
     LogsEnded(PaneId, ContentKey),
     /// One stats sample for a container.

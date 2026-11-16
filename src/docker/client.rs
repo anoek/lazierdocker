@@ -50,21 +50,23 @@ pub fn resolve_host(flag: Option<&str>) -> String {
 }
 
 impl Docker {
-    /// Connect to the daemon the docker CLI would use.
-    pub fn connect() -> Result<Self> {
-        Self::connect_to(&resolve_host(None))
+    /// Connect to the daemon the docker CLI would use (`flag` is `-H`).
+    pub fn connect(flag: Option<&str>) -> Result<Self> {
+        let host = resolve_host(flag);
+        let tls = std::env::var("DOCKER_TLS_VERIFY").is_ok_and(|v| !v.is_empty() && v != "0");
+        if tls && !host.starts_with("unix://") {
+            anyhow::bail!("unsupported docker host {host}: TLS (DOCKER_TLS_VERIFY) is not supported yet");
+        }
+        Self::connect_to(&host)
     }
 
-    /// Connect to an explicit `unix://`, `tcp://` or `http://` address. Any
-    /// other scheme is an error: we never silently connect somewhere else.
+    /// Connect to an explicit `unix://` or `tcp://` (alias `http://`) address.
+    /// Any other scheme is an error: we never silently connect somewhere else.
     pub fn connect_to(host: &str) -> Result<Self> {
         const TIMEOUT_SECS: u64 = 30;
         let api = if host.starts_with("unix://") {
             bollard::Docker::connect_with_unix(host, TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)
         } else if host.starts_with("tcp://") || host.starts_with("http://") {
-            if std::env::var("DOCKER_TLS_VERIFY").is_ok_and(|v| !v.is_empty() && v != "0") {
-                anyhow::bail!("unsupported docker host {host}: TLS (DOCKER_TLS_VERIFY) is not supported yet");
-            }
             bollard::Docker::connect_with_http(host, TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)
         } else {
             anyhow::bail!(
@@ -75,14 +77,9 @@ impl Docker {
         Ok(Self { api, host: host.to_string() })
     }
 
-    pub async fn ping(&self) -> Result<()> {
-        self.api.ping().await.context("docker ping")?;
-        Ok(())
-    }
-
     pub async fn snapshot(&self, local: Option<&LocalCompose>) -> Result<Snapshot> {
         let containers_f = self.api.list_containers(Some(ListContainersOptions { all: true, ..Default::default() }));
-        let images_f = self.api.list_images(Some(ListImagesOptions { all: false, ..Default::default() }));
+        let images_f = self.api.list_images(None::<ListImagesOptions>);
         let volumes_f = self.api.list_volumes(None::<ListVolumesOptions>);
         let networks_f = self.api.list_networks(None::<ListNetworksOptions>);
         let (containers, images, volumes, networks) = tokio::join!(containers_f, images_f, volumes_f, networks_f);
@@ -114,7 +111,7 @@ pub async fn detect_local_compose(compose_files: &[String], project: Option<&str
         cmd.arg("-p").arg(p);
     }
     cmd.args(["config", "--format", "json"]);
-    cmd.stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
     let out = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await.ok()?.ok()?;
     if !out.status.success() {
         return None;
@@ -122,7 +119,7 @@ pub async fn detect_local_compose(compose_files: &[String], project: Option<&str
     parse_compose_config(&out.stdout)
 }
 
-pub fn parse_compose_config(json: &[u8]) -> Option<LocalCompose> {
+fn parse_compose_config(json: &[u8]) -> Option<LocalCompose> {
     let v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let project = v.get("name")?.as_str()?.to_string();
     let mut services: Vec<String> =
@@ -143,11 +140,6 @@ mod tests {
         assert_eq!(l.services, vec!["db", "web"]);
         assert!(parse_compose_config(b"not json").is_none());
     }
-}
-
-#[cfg(test)]
-mod host_tests {
-    use super::*;
 
     #[test]
     fn unsupported_schemes_are_rejected_not_redirected() {

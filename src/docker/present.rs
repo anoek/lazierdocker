@@ -40,7 +40,7 @@ pub fn state_color(c: &Container, theme: &Theme) -> Color {
     }
 }
 
-pub fn health_span(h: Health, theme: &Theme) -> Span<'static> {
+fn health_span(h: Health, theme: &Theme) -> Span<'static> {
     match h {
         Health::Healthy => Span::styled("✔", Style::default().fg(theme.green)),
         Health::Unhealthy => Span::styled("?", Style::default().fg(theme.red)),
@@ -93,43 +93,35 @@ pub fn ports(ps: &[Port]) -> String {
 /// First published port as a browser URL (lazydocker `w`): 0.0.0.0 → localhost.
 pub fn browser_url(ps: &[Port]) -> Option<String> {
     let p = ps.iter().find(|p| p.public.is_some())?;
-    let ip = match p.ip.as_deref() {
-        None | Some("0.0.0.0") | Some("::") | Some("") => "localhost",
-        Some(ip) => ip,
+    let host = match p.ip.as_deref() {
+        None | Some("0.0.0.0") | Some("::") | Some("") => "localhost".to_string(),
+        Some(ip) if ip.contains(':') => format!("[{ip}]"),
+        Some(ip) => ip.to_string(),
     };
-    Some(format!("http://{ip}:{}/", p.public?))
+    Some(format!("http://{host}:{}/", p.public?))
+}
+
+fn human(bytes: i64, base: f64, units: &[&str]) -> String {
+    let (mut v, mut i) = (bytes.max(0) as f64, 0);
+    while v >= base && i < units.len() - 1 {
+        v /= base;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{v:.0}{}", units[0])
+    } else {
+        format!("{v:.1}{}", units[i])
+    }
 }
 
 /// Human-readable size in decimal units (lazydocker list columns).
 pub fn size(bytes: i64) -> String {
-    const UNITS: [&str; 6] = ["B", "kB", "MB", "GB", "TB", "PB"];
-    let mut v = bytes.max(0) as f64;
-    let mut i = 0;
-    while v >= 1000.0 && i < UNITS.len() - 1 {
-        v /= 1000.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{v:.0}{}", UNITS[i])
-    } else {
-        format!("{v:.1}{}", UNITS[i])
-    }
+    human(bytes, 1000.0, &["B", "kB", "MB", "GB", "TB", "PB"])
 }
 
-/// Binary units (image history).
+/// Binary units (memory, image history).
 pub fn size_binary(bytes: i64) -> String {
-    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    let mut v = bytes.max(0) as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{v:.0}{}", UNITS[i])
-    } else {
-        format!("{v:.1}{}", UNITS[i])
-    }
+    human(bytes, 1024.0, &["B", "KiB", "MiB", "GiB", "TiB", "PiB"])
 }
 
 #[cfg(test)]
@@ -159,6 +151,7 @@ mod tests {
             Some("http://localhost:8080/")
         );
         assert_eq!(browser_url(&[port(None, 6379, None)]), None);
+        assert_eq!(browser_url(&[port(Some("::1"), 80, Some(8080))]).as_deref(), Some("http://[::1]:8080/"));
     }
 
     #[test]

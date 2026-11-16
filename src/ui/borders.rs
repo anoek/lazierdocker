@@ -10,7 +10,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
-use super::layout::PaneId;
+use super::text::truncate;
 use super::theme::Theme;
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,7 +23,6 @@ struct LineCell {
 }
 
 pub struct PaneFrame<'a> {
-    pub id: PaneId,
     pub rect: Rect,
     pub title: &'a str,
     pub focused: bool,
@@ -65,12 +64,10 @@ fn glyph(c: LineCell) -> &'static str {
     }
 }
 
-/// Draw all pane frames and titles. Returns the inner rect of each pane.
-pub fn draw(buf: &mut Buffer, area: Rect, panes: &[PaneFrame<'_>], theme: &Theme) -> HashMap<PaneId, Rect> {
+/// Draw all pane frames and titles (see [`inner`] for each pane's content rect).
+pub fn draw(buf: &mut Buffer, area: Rect, panes: &[PaneFrame<'_>], theme: &Theme) {
     let mut cells: HashMap<(u16, u16), LineCell> = HashMap::new();
-    let mut inners = HashMap::new();
     for p in panes {
-        inners.insert(p.id, inner(area, p.rect));
         let Some((l, t, r, b)) = outline(area, p.rect) else {
             continue;
         };
@@ -131,37 +128,12 @@ pub fn draw(buf: &mut Buffer, area: Rect, panes: &[PaneFrame<'_>], theme: &Theme
         };
         buf.set_stringn(l + 2, t, &label, max, style);
     }
-    inners
-}
-
-/// Truncate to `max` display columns, adding `…` when shortened.
-pub fn truncate(s: &str, max: usize) -> String {
-    use unicode_width::UnicodeWidthChar;
-    let total: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
-    if total <= max {
-        return s.to_string();
-    }
-    if max == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut w = 0;
-    for ch in s.chars() {
-        let cw = ch.width().unwrap_or(0);
-        if w + cw > max - 1 {
-            break;
-        }
-        out.push(ch);
-        w += cw;
-    }
-    out.push('…');
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::layout::{Layout, SplitDir};
+    use crate::ui::layout::{Layout, PaneId, SplitDir};
 
     fn sym(buf: &Buffer, x: u16, y: u16) -> &str {
         buf[(x, y)].symbol()
@@ -175,7 +147,7 @@ mod tests {
         l.split(PaneId(1), SplitDir::Vertical, PaneId(3));
         l.split(PaneId(2), SplitDir::Vertical, PaneId(4));
         let frames: Vec<PaneFrame> =
-            l.rects(area).into_iter().map(|(id, rect)| PaneFrame { id, rect, title: "", focused: false }).collect();
+            l.rects(area).into_iter().map(|(_, rect)| PaneFrame { rect, title: "", focused: false }).collect();
         let mut buf = Buffer::empty(area);
         draw(&mut buf, area, &frames, &Theme::default());
         assert_eq!(sym(&buf, 0, 0), "┌");
@@ -202,17 +174,10 @@ mod tests {
     #[test]
     fn title_drawn_on_top_border_truncated() {
         let area = Rect::new(0, 0, 12, 4);
-        let frames = [PaneFrame { id: PaneId(1), rect: area, title: "a-very-long-title", focused: true }];
+        let frames = [PaneFrame { rect: area, title: "a-very-long-title", focused: true }];
         let mut buf = Buffer::empty(area);
         draw(&mut buf, area, &frames, &Theme::default());
         let top: String = (0..12).map(|x| sym(&buf, x, 0).to_string()).collect();
         assert_eq!(top, "┌─ a-very… ┐");
-    }
-
-    #[test]
-    fn truncate_wide_chars() {
-        assert_eq!(truncate("hello", 5), "hello");
-        assert_eq!(truncate("hello", 4), "hel…");
-        assert_eq!(truncate("日本語", 4), "日…");
     }
 }

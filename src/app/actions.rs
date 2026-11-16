@@ -1,14 +1,13 @@
 //! Actions: what menu items, confirmations and context menus do.
 
 use super::overlay::{Menu, MenuItem, Overlay};
-use super::{App, Effect, Focus, PaneKind};
+use super::{App, Effect, PaneKind};
+use crate::docker::ops::DockerOp;
 use crate::ui::layout::{PaneId, SplitDir};
 use crate::ui::sidebar::NodeKey;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    None,
-    Quit,
     OpenLogs(NodeKey),
     Exec(NodeKey),
     Attach(NodeKey),
@@ -22,7 +21,7 @@ pub enum Action {
     FullLogs(PaneId),
     Copy(String),
     Help,
-    Docker(crate::docker::ops::DockerOp),
+    Docker(DockerOp),
     /// Run an attached command in a new terminal pane.
     RunInPane {
         title: String,
@@ -41,12 +40,20 @@ pub enum Action {
     Error(String),
 }
 
+impl Action {
+    /// Confirm before `action`. An error is shown as it is: there is nothing to confirm.
+    pub fn ask(title: &str, body: String, danger: bool, action: Action) -> Action {
+        match action {
+            Action::Error(_) => action,
+            _ => Action::Ask { title: title.into(), body, danger, action: Box::new(action) },
+        }
+    }
+}
+
 impl App {
     pub fn perform(&mut self, action: Action) -> Vec<Effect> {
         self.dirty = true;
         match action {
-            Action::None => Vec::new(),
-            Action::Quit => vec![Effect::Quit],
             Action::OpenLogs(k) => {
                 self.open_logs(k);
                 Vec::new()
@@ -54,11 +61,7 @@ impl App {
             Action::Exec(k) => self.exec_shell(&k),
             Action::Attach(k) => self.attach(&k),
             Action::Pin(k, dir) => {
-                let tab = self.primary_inspector().and_then(|id| self.pane_tab(id));
-                let id = self.open_pane(PaneKind::Pinned(k), Some(dir));
-                if let Some(t) = tab {
-                    self.set_tab(id, t);
-                }
+                self.open_split(PaneKind::Pinned(k), dir);
                 Vec::new()
             }
             Action::ToggleCollapse(k) => {
@@ -76,8 +79,7 @@ impl App {
                 Vec::new()
             }
             Action::ZoomPane(id) => {
-                self.layout.focus = id;
-                self.focus = Focus::Panes;
+                self.focus_pane(id);
                 self.layout.toggle_zoom();
                 Vec::new()
             }
@@ -100,7 +102,7 @@ impl App {
                 Vec::new()
             }
             Action::Menu(m) => {
-                self.open_menu(m);
+                self.overlay = Some(Overlay::Menu(m));
                 Vec::new()
             }
             Action::OpenUrl(url) => vec![Effect::OpenUrl(url)],
@@ -144,13 +146,9 @@ impl App {
             NodeKey::Container(id) => self.snap.container(id).map(|c| c.name.clone()).unwrap_or_default(),
             NodeKey::Service(_, s) => s.clone(),
             NodeKey::Project(p) => p.clone(),
-            NodeKey::Image(id) => {
-                self.snap.images.iter().find(|i| &i.id == id).map(|i| i.display()).unwrap_or_default()
-            }
+            NodeKey::Image(id) => self.snap.image(id).map(|i| i.display()).unwrap_or_default(),
             NodeKey::Volume(v) => v.clone(),
-            NodeKey::Network(id) => {
-                self.snap.networks.iter().find(|n| &n.id == id).map(|n| n.name.clone()).unwrap_or_default()
-            }
+            NodeKey::Network(id) => self.snap.network(id).map(|n| n.name.clone()).unwrap_or_default(),
             NodeKey::Section(s) => s.title().to_string(),
         }
     }

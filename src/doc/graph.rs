@@ -25,7 +25,7 @@ pub fn bars(
     let max = shown.iter().copied().fold(floor_max, f64::max).max(f64::EPSILON);
     let mut rows = Vec::with_capacity(height);
     for r in 0..height {
-        // Row r covers [lo, hi) in eighths, counted from the bottom.
+        // Each row shows 8 levels (one block glyph); rows count down from the top.
         let level_from_bottom = height - 1 - r;
         let label = if r == 0 {
             format!("{max:>7.1} ")

@@ -2,17 +2,26 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use unicode_width::UnicodeWidthStr;
+
+use crate::ui::text::truncate;
 use crate::ui::theme::Theme;
 
 pub struct Status<'a> {
-    pub pill: Option<(&'a str, ratatui::style::Color)>,
+    pub pill: Option<(&'a str, Color)>,
     /// Text being typed or a search summary, shown after the pill.
     pub prompt: Option<String>,
     pub hints: &'a [(&'a str, &'a str)],
-    pub right: Option<(String, bool /*error*/)>,
+    pub right: Right,
+}
+
+/// Right-aligned status: the docker host, a message, or an error.
+pub struct Right {
+    pub text: String,
+    pub error: bool,
 }
 
 pub fn render(buf: &mut Buffer, area: Rect, s: &Status<'_>, t: &Theme) {
@@ -26,10 +35,8 @@ pub fn render(buf: &mut Buffer, area: Rect, s: &Status<'_>, t: &Theme) {
             format!(" {label} "),
             Style::default().bg(color).fg(t.panel_bg).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::raw(" "));
-    } else {
-        spans.push(Span::raw(" "));
     }
+    spans.push(Span::raw(" "));
     if let Some(p) = &s.prompt {
         spans.push(Span::styled(p.clone(), Style::default().fg(t.text).add_modifier(Modifier::BOLD)));
         spans.push(Span::raw("   "));
@@ -43,17 +50,14 @@ pub fn render(buf: &mut Buffer, area: Rect, s: &Status<'_>, t: &Theme) {
     }
     let left = Line::from(spans);
     // The right side never takes more than half the bar, so hints stay visible.
-    let right = s.right.as_ref().map(|(r, err)| (crate::ui::borders::truncate(r, (area.width / 2) as usize), *err));
-    let right_w =
-        right.as_ref().map(|(r, _)| unicode_width::UnicodeWidthStr::width(r.as_str()) as u16 + 1).unwrap_or(0);
+    let right = truncate(&s.right.text, (area.width / 2) as usize);
+    let right_w = right.width() as u16 + 1;
     let left_max = area.width.saturating_sub(right_w);
     buf.set_line(area.x, area.y, &left, left_max);
-    if let Some((text, err)) = &right {
-        let style = if *err {
-            Style::default().fg(t.red).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(t.overlay0)
-        };
-        buf.set_stringn(area.right() - right_w, area.y, text, right_w as usize, style.bg(t.panel_bg));
-    }
+    let style = if s.right.error {
+        Style::default().fg(t.red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(t.overlay0)
+    };
+    buf.set_stringn(area.right() - right_w, area.y, &right, right_w as usize, style.bg(t.panel_bg));
 }

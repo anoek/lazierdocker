@@ -1,19 +1,22 @@
 //! Compose (geometry + hit map) and draw. The only place that writes `hits`.
 
+use std::time::Duration;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
-
+use ratatui::style::{Modifier, Style};
 use ratatui::Frame;
-
-use ratatui::style::Modifier;
 
 use super::inspect::{kind_of, tabs_for};
 use super::{App, Content, Focus, Hits, Mode, PaneKind};
 use crate::ui::borders::{self, PaneFrame};
 use crate::ui::layout::PaneId;
 use crate::ui::sidebar::{NodeKey, RenderCtx};
-use crate::ui::statusbar::{self, Status};
+use crate::ui::statusbar::{self, Right, Status};
+use crate::ui::text::wrap;
+
+/// How long a status-bar message stays.
+const TOAST: Duration = Duration::from_secs(4);
 
 type StatusHints<'a> = (Option<(&'a str, ratatui::style::Color)>, &'a [(&'a str, &'a str)]);
 
@@ -27,7 +30,6 @@ impl App {
     }
 
     pub fn render_buf(&mut self, buf: &mut Buffer, area: Rect) {
-        self.refresh_find();
         self.size = (area.width, area.height);
         self.cursor = None;
         let mut hits = Hits::default();
@@ -50,7 +52,6 @@ impl App {
         hits.pane_area = pane_area;
 
         if sidebar_w >= 3 {
-            let rows = self.rows().to_vec();
             let ctx = RenderCtx {
                 snap: &self.snap,
                 cpu: &self.cpu,
@@ -59,26 +60,28 @@ impl App {
                 title: "lazierdocker",
                 filter_editing: self.mode == Mode::Filter,
             };
-            hits.sidebar = self.sidebar.render(buf, sidebar_area, &rows, &ctx);
+            hits.sidebar = self.sidebar.render(buf, sidebar_area, &self.rows, &ctx);
             hits.sidebar_divider = Some(Rect::new(pane_area.x, pane_area.y, 1, pane_area.height));
         }
 
         // Panes.
         let rects = self.layout.rects(pane_area);
-        let titles: Vec<(PaneId, String)> = rects.iter().map(|(id, _)| (*id, self.pane_title(*id))).collect();
+        let titles: Vec<String> = rects.iter().map(|(id, _)| self.pane_title(*id)).collect();
         let frames: Vec<PaneFrame<'_>> = rects
             .iter()
             .zip(titles.iter())
-            .map(|((id, rect), (_, title))| PaneFrame {
-                id: *id,
+            .map(|((id, rect), title)| PaneFrame {
                 rect: *rect,
                 title,
                 focused: self.focus == Focus::Panes && *id == self.layout.focus,
             })
             .collect();
-        let inners = borders::draw(buf, pane_area, &frames, &t);
+        borders::draw(buf, pane_area, &frames, &t);
+        if let Some(div) = hits.sidebar_divider {
+            self.sidebar.draw_scrollbar(buf, div.x, hits.sidebar.list_area, self.rows.len());
+        }
         for (id, rect) in &rects {
-            let inner = inners.get(id).copied().unwrap_or_default();
+            let inner = borders::inner(pane_area, *rect);
             hits.panes.push((*id, *rect, inner));
             self.render_pane(buf, *id, inner, &mut hits);
         }
@@ -112,21 +115,11 @@ impl App {
             NodeKey::Container(id) => {
                 self.snap.container(id).map(|c| c.name.clone()).unwrap_or_else(|| "container (gone)".into())
             }
-            NodeKey::Image(id) => self
-                .snap
-                .images
-                .iter()
-                .find(|i| &i.id == id)
-                .map(|i| i.display())
-                .unwrap_or_else(|| "image (gone)".into()),
+            NodeKey::Image(id) => self.snap.image(id).map(|i| i.display()).unwrap_or_else(|| "image (gone)".into()),
             NodeKey::Volume(n) => format!("volume {n}"),
-            NodeKey::Network(id) => self
-                .snap
-                .networks
-                .iter()
-                .find(|n| &n.id == id)
-                .map(|n| format!("network {}", n.name))
-                .unwrap_or_else(|| "network (gone)".into()),
+            NodeKey::Network(id) => {
+                self.snap.network(id).map(|n| format!("network {}", n.name)).unwrap_or_else(|| "network (gone)".into())
+            }
         }
     }
 
@@ -141,7 +134,7 @@ impl App {
                 None => "Connecting to docker…".to_string(),
             };
             let width = inner.width.saturating_sub(2).max(1) as usize;
-            for (i, line) in super::overlay::wrap(&msg, width).iter().take(inner.height as usize).enumerate() {
+            for (i, line) in wrap(&msg, width).iter().take(inner.height as usize).enumerate() {
                 buf.set_stringn(inner.x + 1, inner.y + i as u16, line, width, Style::default().fg(t.subtext0));
             }
             return;
@@ -207,44 +200,26 @@ impl App {
     }
 
     fn paint_find(&self, buf: &mut Buffer, id: PaneId, area: Rect) {
-        let Some(f) = self.find.as_ref().filter(|f| f.pane == id) else { return };
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
+        let Some(f) = self.shown_find().filter(|f| f.pane == id) else { return };
         let t = self.theme;
-        let top = self.content_top(id);
-        let bottom = top + area.height as usize;
+        let origin = (self.content_top(id), self.content_left(id));
         let other = Style::default().bg(t.surface1).fg(t.yellow);
         let current = Style::default().bg(t.yellow).fg(t.panel_bg).add_modifier(Modifier::BOLD);
-        let first = f.matches.partition_point(|m| m.end.0 < top);
+        let first = f.matches.partition_point(|m| m.end.0 < origin.0);
         for (i, m) in f.matches.iter().enumerate().skip(first) {
-            if m.start.0 >= bottom {
+            if m.start.0 >= origin.0 + area.height as usize {
                 break;
             }
             let style = if f.current == Some(i) { current } else { other };
-            for row in m.start.0.max(top)..=m.end.0.min(bottom - 1) {
-                let from = if row == m.start.0 { m.start.1 } else { 0 };
-                let to = if row == m.end.0 { m.end.1 } else { area.width as usize - 1 };
-                for col in from..=to.min(area.width as usize - 1) {
-                    buf[(area.x + col as u16, area.y + (row - top) as u16)].set_style(style);
-                }
-            }
+            paint_range(buf, area, origin, m.start, m.end, style);
         }
     }
 
     fn paint_selection(&self, buf: &mut Buffer, id: PaneId, area: Rect) {
         let Some(sel) = self.selection.filter(|s| s.pane == id && s.is_visible()) else { return };
-        let t = self.theme;
-        let top = self.content_top(id);
-        let left = self.content_left(id);
-        let style = Style::default().bg(t.surface1).fg(t.text);
-        for y in 0..area.height {
-            for x in 0..area.width {
-                if sel.contains(top + y as usize, left + x as usize) {
-                    buf[(area.x + x, area.y + y)].set_style(style);
-                }
-            }
-        }
+        let (start, end) = sel.ordered();
+        let origin = (self.content_top(id), self.content_left(id));
+        paint_range(buf, area, origin, start, end, Style::default().bg(self.theme.surface1).fg(self.theme.text));
     }
 
     fn render_status(&self, buf: &mut Buffer, area: Rect) {
@@ -320,20 +295,68 @@ impl App {
                 ),
             },
         };
-        let toast = self.toast.as_ref().filter(|(_, at)| at.elapsed() < std::time::Duration::from_secs(4));
+        let toast = self.toast.as_ref().filter(|(_, at)| at.elapsed() < TOAST);
         const SPIN: [&str; 4] = ["|", "/", "-", "\\"];
-        let right = match (&self.docker_error, toast) {
-            _ if self.deferred.is_some() => {
-                Some(("⚠ message waiting: leave the terminal (^b h) to see it".into(), true))
-            }
+        let (text, error) = match (&self.docker_error, toast) {
+            _ if !self.deferred.is_empty() => ("⚠ message waiting: leave the terminal (^b h) to see it".into(), true),
             _ if !self.pending_ops.is_empty() => {
-                Some((format!("{} {}…", SPIN[(self.tick % 4) as usize], self.pending_ops.join(", ")), false))
+                (format!("{} {}…", SPIN[(self.tick % 4) as usize], self.pending_ops.join(", ")), false)
             }
-            (_, Some((msg, _))) => Some((format!("● {msg}"), false)),
-            (Some(e), None) => Some((format!("⚠ {e}"), true)),
-            (None, None) => Some((self.host.clone(), false)),
+            (_, Some((msg, _))) => (format!("● {msg}"), false),
+            (Some(e), None) => (format!("⚠ {e}"), true),
+            (None, None) => (self.host.clone(), false),
         };
+        let right = Right { text, error };
         let prompt = self.find_status();
         statusbar::render(buf, area, &Status { pill, prompt, hints, right }, &t);
+    }
+}
+
+/// Style the stream range `start..=end` of content (rows, columns) drawn in
+/// `area` with `origin` (top row, left column) at its top-left corner.
+fn paint_range(
+    buf: &mut Buffer,
+    area: Rect,
+    origin: (usize, usize),
+    start: (usize, usize),
+    end: (usize, usize),
+    style: Style,
+) {
+    let (top, left) = origin;
+    let (rows, cols) = (area.height as usize, area.width as usize);
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    for row in start.0.max(top)..=end.0.min(top + rows - 1) {
+        let from = if row == start.0 { start.1 } else { 0 }.max(left);
+        let to = if row == end.0 { end.1 } else { usize::MAX }.min(left + cols - 1);
+        for col in from..=to {
+            buf[(area.x + (col - left) as u16, area.y + (row - top) as u16)].set_style(style);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Color;
+
+    use super::*;
+
+    #[test]
+    fn paint_range_is_a_stream_selection() {
+        let area = Rect::new(0, 0, 10, 4);
+        let mark = Style::default().bg(Color::Red);
+        let on = |buf: &Buffer, x: u16, y: u16| buf[(x, y)].bg == Color::Red;
+        // Content rows 2..=4 show at screen rows 1..=3; columns from 0.
+        let mut buf = Buffer::empty(area);
+        paint_range(&mut buf, area, (1, 0), (2, 5), (4, 3), mark);
+        assert!(on(&buf, 5, 1) && on(&buf, 9, 1) && !on(&buf, 4, 1), "rest of the first line");
+        assert!(on(&buf, 0, 2) && on(&buf, 9, 2), "middle lines whole");
+        assert!(on(&buf, 3, 3) && !on(&buf, 4, 3), "last line up to the end");
+        assert!(!on(&buf, 0, 0), "rows outside the range");
+        // Scrolled sideways by 4: column 5 shows at x 1.
+        let mut buf = Buffer::empty(area);
+        paint_range(&mut buf, area, (0, 4), (0, 5), (0, 6), mark);
+        assert!(!on(&buf, 0, 0) && on(&buf, 1, 0) && on(&buf, 2, 0) && !on(&buf, 3, 0));
     }
 }

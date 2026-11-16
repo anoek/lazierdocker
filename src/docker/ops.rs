@@ -74,6 +74,26 @@ pub fn is_must_stop(err: &str) -> bool {
         || e.contains("cannot remove a running container")
 }
 
+/// Await every request; fail with all their errors, one per line.
+async fn all_ok<T, E: std::fmt::Display>(
+    futs: impl IntoIterator<Item = impl std::future::Future<Output = Result<T, E>>>,
+) -> Result<()> {
+    let errs: Vec<String> =
+        futures_util::future::join_all(futs).await.into_iter().filter_map(|r| r.err().map(|e| e.to_string())).collect();
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(errs.join("\n")))
+    }
+}
+
+fn pruned(n: usize, what: &str, reclaimed: Option<i64>) -> Option<String> {
+    Some(match reclaimed {
+        Some(bytes) => format!("pruned {n} {what}, reclaimed {}", size(bytes)),
+        None => format!("pruned {n} {what}"),
+    })
+}
+
 /// Run an operation. Returns an optional success message.
 pub async fn run(docker: &Docker, op: DockerOp) -> Result<Option<String>> {
     let api = &docker.api;
@@ -94,62 +114,53 @@ pub async fn run(docker: &Docker, op: DockerOp) -> Result<Option<String>> {
         DockerOp::RemoveNetwork { id } => api.remove_network(&id).await?,
         DockerOp::PruneContainers => {
             let r = api.prune_containers(None::<PruneContainersOptions>).await?;
-            let n = r.containers_deleted.map(|v| v.len()).unwrap_or(0);
-            return Ok(Some(format!("pruned {n} containers, reclaimed {}", size(r.space_reclaimed.unwrap_or(0)))));
+            let n = r.containers_deleted.map_or(0, |v| v.len());
+            return Ok(pruned(n, "containers", Some(r.space_reclaimed.unwrap_or(0))));
         }
         DockerOp::PruneImages => {
             let r = api.prune_images(None::<PruneImagesOptions>).await?;
-            let n = r.images_deleted.map(|v| v.len()).unwrap_or(0);
-            return Ok(Some(format!("pruned {n} images, reclaimed {}", size(r.space_reclaimed.unwrap_or(0)))));
+            let n = r.images_deleted.map_or(0, |v| v.len());
+            return Ok(pruned(n, "images", Some(r.space_reclaimed.unwrap_or(0))));
         }
         DockerOp::PruneVolumes => {
             let r = api.prune_volumes(None::<PruneVolumesOptions>).await?;
-            let n = r.volumes_deleted.map(|v| v.len()).unwrap_or(0);
-            return Ok(Some(format!("pruned {n} volumes, reclaimed {}", size(r.space_reclaimed.unwrap_or(0)))));
+            let n = r.volumes_deleted.map_or(0, |v| v.len());
+            return Ok(pruned(n, "volumes", Some(r.space_reclaimed.unwrap_or(0))));
         }
         DockerOp::PruneNetworks => {
             let r = api.prune_networks(None::<PruneNetworksOptions>).await?;
-            let n = r.networks_deleted.map(|v| v.len()).unwrap_or(0);
-            return Ok(Some(format!("pruned {n} networks")));
+            let n = r.networks_deleted.map_or(0, |v| v.len());
+            return Ok(pruned(n, "networks", None));
         }
         DockerOp::StopAll(ids) => {
-            let futs = ids.iter().map(|id| api.stop_container(id, None::<StopContainerOptions>));
-            let errs: Vec<String> = futures_util::future::join_all(futs)
-                .await
-                .into_iter()
-                .filter_map(|r| r.err().map(|e| e.to_string()))
-                .collect();
-            if !errs.is_empty() {
-                return Err(anyhow!(errs.join("\n")));
-            }
+            all_ok(ids.iter().map(|id| api.stop_container(id, None::<StopContainerOptions>))).await?
         }
         DockerOp::RemoveAll(ids) => {
             let opts = || Some(RemoveContainerOptions { force: true, v: false, link: false });
-            let futs = ids.iter().map(|id| api.remove_container(id, opts()));
-            let errs: Vec<String> = futures_util::future::join_all(futs)
-                .await
-                .into_iter()
-                .filter_map(|r| r.err().map(|e| e.to_string()))
-                .collect();
-            if !errs.is_empty() {
-                return Err(anyhow!(errs.join("\n")));
-            }
+            all_ok(ids.iter().map(|id| api.remove_container(id, opts()))).await?
         }
         DockerOp::Cli(argv) => {
-            let (prog, args) = argv.split_first().ok_or_else(|| anyhow!("empty command"))?;
-            let out = tokio::process::Command::new(prog)
-                .args(args)
-                .env("DOCKER_HOST", &docker.host)
-                .stdin(std::process::Stdio::null())
-                .output()
-                .await?;
-            if !out.status.success() {
-                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                return Err(anyhow!(if err.is_empty() { format!("{} failed", argv.join(" ")) } else { err }));
-            }
+            cli_output(&docker.host, &argv).await?;
         }
     }
     Ok(None)
+}
+
+/// Run a CLI command against the daemon at `host`; its stdout, or its
+/// stderr as the error.
+pub async fn cli_output(host: &str, argv: &[String]) -> Result<String> {
+    let (prog, args) = argv.split_first().ok_or_else(|| anyhow!("empty command"))?;
+    let out = tokio::process::Command::new(prog)
+        .args(args)
+        .env("DOCKER_HOST", host)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(anyhow!(if err.is_empty() { format!("{} failed", argv.join(" ")) } else { err }));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(test)]

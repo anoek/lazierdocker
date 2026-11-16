@@ -44,8 +44,8 @@ pub struct Layout {
     pub zoomed: bool,
 }
 
-pub const MIN_RATIO: f32 = 0.1;
-pub const MAX_RATIO: f32 = 0.9;
+const MIN_RATIO: f32 = 0.1;
+const MAX_RATIO: f32 = 0.9;
 
 pub fn clamp_ratio(r: f32) -> f32 {
     if r.is_nan() {
@@ -76,10 +76,10 @@ fn split_rect(area: Rect, dir: SplitDir, ratio: f32) -> (Rect, Rect) {
 }
 
 impl Node {
-    fn contains(&self, id: PaneId) -> bool {
+    fn first_pane(&self) -> PaneId {
         match self {
-            Node::Pane(p) => *p == id,
-            Node::Split { first, second, .. } => first.contains(id) || second.contains(id),
+            Node::Pane(p) => *p,
+            Node::Split { first, .. } => first.first_pane(),
         }
     }
 
@@ -148,22 +148,22 @@ impl Node {
         }
     }
 
-    /// Remove `id`, collapsing its parent into the sibling. Returns true if removed.
-    fn remove(&mut self, id: PaneId) -> bool {
+    /// Remove `id`, collapsing its parent into the sibling. Returns the pane
+    /// that now occupies its place.
+    fn remove(&mut self, id: PaneId) -> Option<PaneId> {
         let Node::Split { first, second, .. } = self else {
-            return false;
+            return None;
         };
-        if matches!(**first, Node::Pane(p) if p == id) {
-            let sibling = std::mem::replace(second.as_mut(), Node::Pane(id));
-            *self = sibling;
-            return true;
-        }
-        if matches!(**second, Node::Pane(p) if p == id) {
-            let sibling = std::mem::replace(first.as_mut(), Node::Pane(id));
-            *self = sibling;
-            return true;
-        }
-        first.remove(id) || second.remove(id)
+        let is_id = |n: &Node| matches!(n, Node::Pane(p) if *p == id);
+        let sibling = if is_id(first) {
+            std::mem::replace(second.as_mut(), Node::Pane(id))
+        } else if is_id(second) {
+            std::mem::replace(first.as_mut(), Node::Pane(id))
+        } else {
+            return first.remove(id).or_else(|| second.remove(id));
+        };
+        *self = sibling;
+        Some(self.first_pane())
     }
 
     fn swap_ids(&mut self, a: PaneId, b: PaneId) {
@@ -188,10 +188,6 @@ impl Layout {
         Self { root: Node::Pane(id), focus: id, zoomed: false }
     }
 
-    pub fn contains(&self, id: PaneId) -> bool {
-        self.root.contains(id)
-    }
-
     pub fn panes(&self) -> Vec<PaneId> {
         let mut out = Vec::new();
         self.root.collect_panes(&mut out);
@@ -213,19 +209,18 @@ impl Layout {
         ok
     }
 
-    /// Remove a pane. The last pane cannot be removed.
+    /// Remove a pane. The last pane cannot be removed. If it had focus, the
+    /// pane taking its place gets focus and zoom ends (as in tmux).
     pub fn remove(&mut self, id: PaneId) -> bool {
-        if matches!(self.root, Node::Pane(_)) {
-            return false;
-        }
-        let removed = self.root.remove(id);
-        if removed && self.focus == id {
-            self.focus = self.panes()[0];
-        }
-        if removed && self.panes().len() == 1 {
+        let Some(heir) = self.root.remove(id) else { return false };
+        if self.focus == id {
+            self.focus = heir;
             self.zoomed = false;
         }
-        removed
+        if matches!(self.root, Node::Pane(_)) {
+            self.zoomed = false;
+        }
+        true
     }
 
     /// Pane rects tiling `area`. When zoomed, only the focused pane, covering `area`.
@@ -398,6 +393,24 @@ mod tests {
         assert_eq!(l.rects(area())[1], (C, Rect::new(50, 0, 50, 40)));
         assert!(l.remove(C));
         assert!(!l.remove(A), "last pane cannot be removed");
+        assert_eq!(l.focus, A);
+    }
+
+    #[test]
+    fn closing_the_focused_pane_focuses_the_pane_taking_its_place_and_unzooms() {
+        // A | (B / C), C zoomed.
+        let mut l = Layout::new(A);
+        l.split(A, SplitDir::Horizontal, B);
+        l.split(B, SplitDir::Vertical, C);
+        l.toggle_zoom();
+        assert!(l.remove(C));
+        assert_eq!(l.focus, B);
+        assert!(!l.zoomed, "the zoomed pane is gone");
+        // Removing an unfocused pane leaves focus alone.
+        l.focus = A;
+        l.split(A, SplitDir::Vertical, C);
+        l.focus = A;
+        assert!(l.remove(B));
         assert_eq!(l.focus, A);
     }
 

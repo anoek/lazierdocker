@@ -1,13 +1,20 @@
 //! Formatters producing styled lines for the inspector tabs (lazydocker §2 layouts).
 
+use std::collections::HashMap;
+
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 
-use crate::docker::present::{size, size_binary};
+use super::graph;
+use crate::docker::model::Snapshot;
+use crate::docker::present::{self, size, size_binary};
+use crate::docker::stats::StatsHistory;
+use crate::ui::sidebar::Section;
 use crate::ui::theme::Theme;
 
-type Lines = Vec<Line<'static>>;
+/// Styled lines of a document.
+pub type Lines = Vec<Line<'static>>;
 
 fn key_style(t: &Theme) -> Style {
     Style::default().fg(t.cyan)
@@ -307,8 +314,9 @@ pub fn volume_config(v: &Value, t: &Theme) -> Lines {
     out.extend(map_lines(v, "/Labels", t));
     out.push(field("Options", "", PAD, t));
     out.extend(map_lines(v, "/Options", t));
-    out.push(field("Status", if v.pointer("/Status").is_some_and(|s| !s.is_null()) { "" } else { "n/a" }, PAD, t));
-    if v.pointer("/Status").is_some_and(|s| !s.is_null()) {
+    let status = v.pointer("/Status").is_some_and(|s| !s.is_null());
+    out.push(field("Status", if status { "" } else { "n/a" }, PAD, t));
+    if status {
         out.extend(map_lines(v, "/Status", t));
     }
     if let Some(u) = v.pointer("/UsageData") {
@@ -372,6 +380,113 @@ pub fn top(titles: &[String], processes: &[Vec<String>], t: &Theme) -> Lines {
     };
     let mut out = vec![Line::styled(row(titles), Style::default().fg(t.overlay1).add_modifier(Modifier::BOLD))];
     out.extend(processes.iter().map(|p| Line::raw(row(p))));
+    out
+}
+
+/// Stats tab: CPU and memory graphs, PIDs, traffic, memory usage (lazydocker layout).
+pub fn stats(h: Option<&StatsHistory>, running: bool, width: usize, t: &Theme) -> Lines {
+    let dim = Style::default().fg(t.overlay0);
+    let Some(h) = h.filter(|h| !h.samples.is_empty()) else {
+        return vec![Line::styled(if running { "Waiting for stats…" } else { "container is not running" }, dim)];
+    };
+    let latest = h.latest().expect("non-empty");
+    let span = graph::span_label(h.span());
+    let cpu: Vec<f64> = h.samples.iter().map(|(_, s)| s.cpu_percent()).collect();
+    let mem: Vec<f64> = h.samples.iter().map(|(_, s)| s.mem_percent()).collect();
+    let mut out = vec![graph::caption(format!("CPU (%): {:.2} ({span})", latest.cpu_percent()), t.cyan)];
+    out.extend(graph::bars(&cpu, width, 8, 1.0, t.cyan, dim));
+    out.push(Line::raw(""));
+    out.push(graph::caption(format!("Memory (%): {:.2} ({span})", latest.mem_percent()), t.green));
+    out.extend(graph::bars(&mem, width, 8, 1.0, t.green, dim));
+    out.push(Line::raw(""));
+    let kv = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{k:<18}"), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::raw(v),
+        ])
+    };
+    out.push(kv("PIDs:", latest.pids.to_string()));
+    out.push(kv(
+        "Memory:",
+        format!(
+            "{} / {}",
+            present::size_binary(latest.mem_usage as i64),
+            present::size_binary(latest.mem_limit as i64)
+        ),
+    ));
+    out.push(kv("Traffic received:", present::size(latest.rx_bytes as i64)));
+    out.push(kv("Traffic sent:", present::size(latest.tx_bytes as i64)));
+    out
+}
+
+/// Section summary tables.
+pub fn summary(section: Section, snap: &Snapshot, cpu: &HashMap<String, f64>, t: &Theme) -> Lines {
+    let head = |s: String| Line::styled(s, Style::default().fg(t.overlay1).add_modifier(Modifier::BOLD));
+    let dim = Style::default().fg(t.overlay0);
+    let mut out = Vec::new();
+    match section {
+        Section::Projects => {
+            out.push(head(format!("{:<28} {:>9}  {}", "PROJECT", "RUNNING", "SERVICES")));
+            for p in &snap.projects {
+                let running = p
+                    .services
+                    .iter()
+                    .filter(|s| {
+                        s.container_id.as_deref().and_then(|id| snap.container(id)).is_some_and(|c| c.is_running())
+                    })
+                    .count();
+                let names: Vec<&str> = p.services.iter().map(|s| s.name.as_str()).collect();
+                out.push(Line::from(vec![
+                    Span::raw(format!("{:<28} ", p.name)),
+                    Span::raw(format!("{:>9}  ", format!("{running}/{}", p.services.len()))),
+                    Span::styled(names.join(", "), dim),
+                ]));
+            }
+        }
+        Section::Containers => {
+            out.push(head(format!("{:<11} {:<30} {:>8}  {:<28} {}", "STATE", "NAME", "CPU", "PORTS", "IMAGE")));
+            for c in &snap.containers {
+                let state = match present::substatus(c, t) {
+                    Some(sub) => format!("{} {}", c.state.as_str(), sub.content),
+                    None => c.state.as_str().to_string(),
+                };
+                let cpu = cpu.get(&c.id).map(|v| format!("{v:.2}%")).unwrap_or_default();
+                out.push(Line::from(vec![
+                    Span::styled(format!("{state:<11} "), Style::default().fg(present::state_color(c, t))),
+                    Span::raw(format!("{:<30} ", c.name)),
+                    Span::raw(format!("{cpu:>8}  ")),
+                    Span::styled(format!("{:<28} ", present::ports(&c.ports)), Style::default().fg(t.yellow)),
+                    Span::styled(c.image.clone(), Style::default().fg(t.magenta)),
+                ]));
+            }
+        }
+        Section::Images => {
+            out.push(head(format!("{:<40} {:<20} {:>9}  {}", "NAME", "TAG", "SIZE", "ID")));
+            for i in &snap.images {
+                out.push(Line::from(vec![
+                    Span::raw(format!("{:<40} ", i.name)),
+                    Span::raw(format!("{:<20} ", i.tag)),
+                    Span::raw(format!("{:>9}  ", present::size(i.size))),
+                    Span::styled(i.short_id().to_string(), dim),
+                ]));
+            }
+        }
+        Section::Volumes => {
+            out.push(head(format!("{:<10} {}", "DRIVER", "NAME")));
+            for v in &snap.volumes {
+                out.push(Line::from(vec![Span::styled(format!("{:<10} ", v.driver), dim), Span::raw(v.name.clone())]));
+            }
+        }
+        Section::Networks => {
+            out.push(head(format!("{:<10} {}", "DRIVER", "NAME")));
+            for n in &snap.networks {
+                out.push(Line::from(vec![Span::styled(format!("{:<10} ", n.driver), dim), Span::raw(n.name.clone())]));
+            }
+        }
+    }
+    if out.len() == 1 {
+        out.push(Line::styled("none", dim));
+    }
     out
 }
 

@@ -5,7 +5,8 @@ const USAGE: &str = "lazierdocker — a mouse-first terminal UI for Docker
 Usage: lazierdocker [OPTIONS]
 
 Options:
-  -H, --host <HOST>      Docker host (default: $DOCKER_HOST or the local socket)
+  -H, --host <HOST>      Docker host (default: $DOCKER_HOST, then the current docker
+                         context, then unix:///var/run/docker.sock)
   -p, --project <NAME>   Compose project name for the current directory
   -f, --file <FILE>      Compose file (repeatable)
   -h, --help             Show this help

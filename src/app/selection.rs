@@ -41,22 +41,9 @@ impl Selection {
         self.head = to;
     }
 
+    /// A plain click (no movement yet) selects nothing.
     pub fn is_visible(&self) -> bool {
         self.phase != Phase::Anchored
-    }
-
-    /// Stream selection: partial first line, full middle lines, partial last line.
-    pub fn contains(&self, row: usize, col: usize) -> bool {
-        if !self.is_visible() {
-            return false;
-        }
-        let (s, e) = self.ordered();
-        if row < s.0 || row > e.0 {
-            return false;
-        }
-        let after_start = row > s.0 || col >= s.1;
-        let before_end = row < e.0 || col <= e.1;
-        after_start && before_end
     }
 }
 
@@ -64,10 +51,9 @@ fn is_separator(c: char) -> bool {
     c.is_whitespace() || "|()[]{},;!<>\"'`".contains(c)
 }
 
-/// Inclusive char-index bounds of the word at `idx` in `line`: a URL if one
+/// Inclusive char-index bounds of the word at `idx` in a line: a URL if one
 /// covers the position, otherwise a run of non-separator characters.
-pub fn word_bounds(line: &str, idx: usize) -> Option<(usize, usize)> {
-    let chars: Vec<char> = line.chars().collect();
+pub fn word_bounds(chars: &[char], idx: usize) -> Option<(usize, usize)> {
     if idx >= chars.len() || is_separator(chars[idx]) {
         return None;
     }
@@ -108,17 +94,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selection_stream_contains() {
+    fn drag_orders_ends() {
         let mut s = Selection::new(PaneId(1), (2, 5));
-        assert!(!s.contains(2, 5), "a plain click selects nothing");
+        assert!(!s.is_visible(), "a plain click selects nothing");
         s.drag((4, 3));
-        assert!(s.contains(2, 5) && s.contains(2, 80), "rest of first line");
-        assert!(!s.contains(2, 4));
-        assert!(s.contains(3, 0), "middle lines whole");
-        assert!(s.contains(4, 3) && !s.contains(4, 4), "last line up to head");
+        assert!(s.is_visible());
+        assert_eq!(s.ordered(), ((2, 5), (4, 3)));
         // Dragging backwards.
         s.drag((1, 7));
-        assert!(s.contains(1, 7) && s.contains(2, 5) && !s.contains(2, 6));
+        assert_eq!(s.ordered(), ((1, 7), (2, 5)));
     }
 
     #[test]
@@ -133,15 +117,16 @@ mod tests {
     #[test]
     fn word_bounds_url_and_token() {
         let line = "see https://example.com/a(b)/c?x=1, then demo-web-1 (ok)";
+        let word_bounds = |idx| word_bounds(&line.chars().collect::<Vec<_>>(), idx);
         let url_at = line.find("example").unwrap();
-        let (s, e) = word_bounds(line, url_at).unwrap();
+        let (s, e) = word_bounds(url_at).unwrap();
         assert_eq!(&line[s..=e], "https://example.com/a(b)/c?x=1");
         let tok = line.find("web").unwrap();
-        let (s, e) = word_bounds(line, tok).unwrap();
+        let (s, e) = word_bounds(tok).unwrap();
         assert_eq!(&line[s..=e], "demo-web-1");
-        let (s, e) = word_bounds(line, line.find("ok").unwrap()).unwrap();
+        let (s, e) = word_bounds(line.find("ok").unwrap()).unwrap();
         assert_eq!(&line[s..=e], "ok");
-        assert_eq!(word_bounds(line, 3), None, "on a space");
-        assert_eq!(word_bounds(line, 999), None);
+        assert_eq!(word_bounds(3), None, "on a space");
+        assert_eq!(word_bounds(999), None);
     }
 }

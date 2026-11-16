@@ -98,10 +98,11 @@ crate uses Zig to build libghostty-vt from a pinned Ghostty commit, which the fi
 
     make                      # optimised build → target/release/lazierdocker
     make run ARGS="-H tcp://127.0.0.1:23750"
-    make install              # → ~/.local/bin/lazierdocker (PREFIX=/usr/local for system-wide)
+    make install              # → ~/.local/bin/lazierdocker
+    make && sudo make install PREFIX=/usr/local   # system-wide (build first, not as root)
     make uninstall            # same PREFIX as install
 
-`make test` and `make clean` are also available. `make screenshot` regenerates `docs/screenshot.png` from
+`make test`, `make lint` (rustfmt check and clippy with warnings as errors) and `make clean` are also available. `make screenshot` regenerates `docs/screenshot.png` from
 made-up state (needs Chromium and ImageMagick).
 
 Linux and macOS are supported.

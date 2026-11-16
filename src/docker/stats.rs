@@ -1,11 +1,52 @@
 //! Container resource statistics: samples, derived percentages and history.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use bollard::models::ContainerStatsResponse;
+use futures_util::StreamExt;
 
-pub const HISTORY: Duration = Duration::from_secs(180);
+use super::client::Docker;
+use crate::event::{AppEvent, EventTx};
+
+const HISTORY: Duration = Duration::from_secs(180);
+
+/// One live stats stream per running container.
+#[derive(Default)]
+pub struct StatsStreams {
+    tasks: HashMap<String, tokio::task::AbortHandle>,
+}
+
+impl StatsStreams {
+    /// Stream exactly the `running` containers: stop the others, and
+    /// (re)start any whose stream is missing or ended.
+    pub fn sync(&mut self, running: &HashSet<String>, docker: &Docker, tx: &EventTx) {
+        self.tasks.retain(|id, h| {
+            let keep = running.contains(id) && !h.is_finished();
+            if !keep {
+                h.abort();
+            }
+            keep
+        });
+        for id in running {
+            if !self.tasks.contains_key(id) {
+                let task = tokio::spawn(stream(docker.clone(), id.clone(), tx.clone()));
+                self.tasks.insert(id.clone(), task.abort_handle());
+            }
+        }
+    }
+}
+
+/// Send a container's stats samples until its stream ends or fails.
+async fn stream(docker: Docker, id: String, tx: EventTx) {
+    let opts = bollard::query_parameters::StatsOptions { stream: true, one_shot: false };
+    let mut samples = docker.api.stats(&id, Some(opts));
+    while let Some(Ok(s)) = samples.next().await {
+        if tx.send(AppEvent::Stats(id.clone(), StatsSample::from_bollard(&s))).is_err() {
+            break;
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StatsSample {

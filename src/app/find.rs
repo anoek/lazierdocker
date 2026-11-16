@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::{App, Content, Effect, Focus, Mode};
+use super::{plain_char, App, Content, Effect, Focus, Mode};
 use crate::term::find::Match;
+use crate::term::TermSurface;
 use crate::ui::layout::PaneId;
 
 /// Least time between re-searches while output streams in.
@@ -25,11 +26,25 @@ pub struct Find {
     pub current: Option<usize>,
     /// Row the search started from (bottom of the view when it opened).
     origin: usize,
-    /// Viewport top and whether it followed output when `matches` was computed.
-    view: (usize, bool),
+    /// The view when `matches` was computed.
+    view: View,
     /// New output arrived since the last search.
     stale: bool,
     searched_at: Instant,
+}
+
+/// Where a terminal's viewport was.
+#[derive(Debug, Clone, Copy)]
+struct View {
+    top: usize,
+    /// It followed new output.
+    following: bool,
+}
+
+impl View {
+    fn of(t: &TermSurface) -> Self {
+        View { top: t.viewport_top(), following: t.at_bottom() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +61,7 @@ pub enum Step {
 /// ctrl+g; it is only "previous" when the shift is reported. xterm-style
 /// terminals send shift+F3 as `CSI 1;2 R`, which crossterm reads as a cursor
 /// position report, so it only arrives from terminals that send it as F15.
-pub fn motion(k: &KeyEvent) -> Option<Step> {
+pub(super) fn motion(k: &KeyEvent) -> Option<Step> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let shift = k.modifiers.contains(KeyModifiers::SHIFT);
     match k.code {
@@ -95,7 +110,7 @@ impl App {
             matches: Vec::new(),
             current: None,
             origin,
-            view: (top, t.at_bottom()),
+            view: View::of(t),
             stale: false,
             searched_at: Instant::now(),
         });
@@ -105,7 +120,6 @@ impl App {
 
     /// Keys while typing the query.
     pub fn find_key(&mut self, k: KeyEvent) -> Vec<Effect> {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if let Some(step) = motion(&k) {
             self.step_find(step);
             self.dirty = true;
@@ -114,22 +128,12 @@ impl App {
         match k.code {
             KeyCode::Esc => self.close_find(),
             KeyCode::Enter => {
-                let Some(f) = self.find.as_mut() else { return self.leave_find_mode() };
-                if f.query.is_empty() && !self.last_find.is_empty() {
+                // Enter on an empty prompt repeats the last search.
+                if let Some(f) = self.find.as_mut().filter(|f| f.query.is_empty() && !self.last_find.is_empty()) {
                     f.query = self.last_find.clone();
                     self.search(true);
                 }
-                let Some(f) = self.find.as_ref() else { return self.leave_find_mode() };
-                if f.query.is_empty() {
-                    self.close_find();
-                } else if f.matches.is_empty() {
-                    let q = f.query.clone();
-                    self.close_find();
-                    self.flash(format!("not found: {q}"));
-                } else {
-                    self.last_find = f.query.clone();
-                    self.mode = Mode::Normal;
-                }
+                self.commit_find();
             }
             KeyCode::Backspace => {
                 if let Some(f) = self.find.as_mut() {
@@ -139,17 +143,31 @@ impl App {
             }
             KeyCode::Up => self.step_find(Step::Older),
             KeyCode::Down => self.step_find(Step::Newer),
-            KeyCode::Char('f') if ctrl => self.step_find(Step::Older),
-            KeyCode::Char(c) if !ctrl => self.find_type(&c.to_string()),
-            _ => {}
+            KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::CONTROL) => self.step_find(Step::Older),
+            _ => {
+                if let Some(c) = plain_char(&k) {
+                    self.find_type(&c.to_string());
+                }
+            }
         }
         self.dirty = true;
         Vec::new()
     }
 
-    fn leave_find_mode(&mut self) -> Vec<Effect> {
+    /// Stop typing and keep the query: remember it for `n`, or close the
+    /// search when the query is empty or found nothing.
+    pub fn commit_find(&mut self) {
         self.mode = Mode::Normal;
-        Vec::new()
+        let Some(f) = self.find.as_ref() else { return };
+        if f.query.is_empty() {
+            self.close_find();
+        } else if f.matches.is_empty() {
+            let q = f.query.clone();
+            self.close_find();
+            self.flash(format!("not found: {q}"));
+        } else {
+            self.last_find = f.query.clone();
+        }
     }
 
     /// Append typed or pasted text to the query.
@@ -180,8 +198,7 @@ impl App {
         let pane = f.pane;
         let Some(Content::Term(t)) = self.panes.get(&pane).map(|p| &p.content) else { return };
         let matches = t.find(&f.query);
-        let (_, top, _) = t.scrollbar();
-        let view = (top, t.at_bottom());
+        let view = View::of(t);
         let f = self.find.as_mut().expect("checked above");
         let current = if jump {
             // Nearest at or above the origin, else the first below it.
@@ -190,7 +207,8 @@ impl App {
             f.current.map(|i| f.matches[i]).and_then(|old| {
                 // A pinned view moves with its content when old rows are
                 // dropped; follow that shift. A following view doesn't tell.
-                let shift = if f.view.1 || view.1 { 0 } else { view.0 as isize - f.view.0 as isize };
+                let shift =
+                    if f.view.following || view.following { 0 } else { view.top as isize - f.view.top as isize };
                 let row = (old.start.0 as isize + shift).max(0) as usize;
                 let at = (row, old.start.1);
                 matches
@@ -217,7 +235,7 @@ impl App {
             t.reveal_row(row);
         }
         let Some(Content::Term(t)) = self.panes.get(&f.pane).map(|p| &p.content) else { return };
-        let view = (t.scrollbar().1, t.at_bottom());
+        let view = View::of(t);
         if let Some(f) = self.find.as_mut() {
             f.view = view;
         }
@@ -263,12 +281,7 @@ impl App {
             f.query = self.last_find.clone();
         }
         self.search(true);
-        self.mode = Mode::Normal;
-        if self.find.as_ref().is_some_and(|f| f.matches.is_empty()) {
-            let q = self.last_find.clone();
-            self.close_find();
-            self.flash(format!("not found: {q}"));
-        }
+        self.commit_find();
         true
     }
 
@@ -299,9 +312,16 @@ impl App {
         }
     }
 
+    /// The search, while its pane still shows the surface it searched. The
+    /// runtime can replace the surface after `refresh_find` ran and before the
+    /// next frame; then there is nothing to show until it runs again.
+    pub(super) fn shown_find(&self) -> Option<&Find> {
+        self.find.as_ref().filter(|f| matches!(self.content(f.pane), Some(Content::Term(t)) if t.id() == f.surface))
+    }
+
     /// Status bar text: the query and match position.
     pub fn find_status(&self) -> Option<String> {
-        let f = self.find.as_ref().filter(|f| f.pane == self.layout.focus || self.mode == Mode::Find)?;
+        let f = self.shown_find().filter(|f| f.pane == self.layout.focus || self.mode == Mode::Find)?;
         let cursor = if self.mode == Mode::Find { "▏" } else { "" };
         let count = match (f.current, f.matches.len()) {
             _ if f.query.is_empty() => String::new(),

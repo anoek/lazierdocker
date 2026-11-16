@@ -3,17 +3,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio::sync::Notify;
 
 use super::client::Docker;
 use super::model::LocalCompose;
 use crate::event::{AppEvent, EventTx};
 
-pub const THROTTLE: Duration = Duration::from_millis(50);
-pub const RETRY: Duration = Duration::from_secs(2);
-/// Safety-net refresh when no events arrive (e.g. status strings like "Up 5 minutes").
-pub const IDLE_REFRESH: Duration = Duration::from_secs(15);
+const THROTTLE: Duration = Duration::from_millis(50);
+const RETRY: Duration = Duration::from_secs(2);
+/// Safety-net refresh in case events were missed.
+const IDLE_REFRESH: Duration = Duration::from_secs(15);
 
 /// Handle to request an immediate refresh (e.g. after an action completes).
 #[derive(Clone)]
@@ -30,7 +30,8 @@ impl Refresher {
 pub fn spawn_refresh(docker: Docker, local: Option<LocalCompose>, tx: EventTx) -> Refresher {
     let notify = Arc::new(Notify::new());
 
-    // Events stream → poke.
+    // Events stream → poke. If the stream fails, refresh every RETRY until it
+    // reconnects; the snapshot loop reports an unreachable daemon.
     {
         let docker = docker.clone();
         let notify = notify.clone();
@@ -38,14 +39,8 @@ pub fn spawn_refresh(docker: Docker, local: Option<LocalCompose>, tx: EventTx) -
         tokio::spawn(async move {
             loop {
                 let mut stream = docker.api.events(None::<bollard::query_parameters::EventsOptions>);
-                while let Some(ev) = stream.next().await {
-                    match ev {
-                        Ok(_) => notify.notify_one(),
-                        Err(e) => {
-                            let _ = tx.send(AppEvent::DockerError(format!("docker events: {e}")));
-                            break;
-                        }
-                    }
+                while let Some(Ok(_)) = stream.next().await {
+                    notify.notify_one();
                 }
                 if tx.is_closed() {
                     return;
@@ -61,8 +56,12 @@ pub fn spawn_refresh(docker: Docker, local: Option<LocalCompose>, tx: EventTx) -
         let notify = notify.clone();
         tokio::spawn(async move {
             loop {
-                let ok = match docker.snapshot(local.as_ref()).await {
-                    Ok(s) => tx.send(AppEvent::Snapshot(Box::new(s))).is_ok(),
+                match docker.snapshot(local.as_ref()).await {
+                    Ok(s) => {
+                        if tx.send(AppEvent::Snapshot(Box::new(s))).is_err() {
+                            return;
+                        }
+                    }
                     Err(e) => {
                         if tx.send(AppEvent::DockerError(format!("{e:#}"))).is_err() {
                             return;
@@ -70,16 +69,15 @@ pub fn spawn_refresh(docker: Docker, local: Option<LocalCompose>, tx: EventTx) -
                         tokio::time::sleep(RETRY).await;
                         continue;
                     }
-                };
-                if !ok {
-                    return;
                 }
                 tokio::select! {
                     _ = notify.notified() => {}
                     _ = tokio::time::sleep(IDLE_REFRESH) => {}
                 }
-                // Coalesce bursts of events into one refresh.
+                // Coalesce bursts of events (a stop emits kill, die, stop, …)
+                // into one refresh, dropping the poke they left behind.
                 tokio::time::sleep(THROTTLE).await;
+                let _ = notify.notified().now_or_never();
             }
         });
     }

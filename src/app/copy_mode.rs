@@ -1,10 +1,11 @@
-//! Keyboard copy mode (prefix+[) and resize mode (prefix+r), herdr-style.
+//! Keyboard copy mode (prefix+[), herdr-style.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::selection::{Phase, Selection};
 use super::{App, Content, Effect, Mode};
-use crate::ui::layout::{Dir4, PaneId};
+use crate::ui::layout::PaneId;
+use crate::ui::text::{char_to_col, col_to_char};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CopyCursor {
@@ -16,31 +17,19 @@ pub struct CopyCursor {
 }
 
 impl App {
-    fn content_rows(&self, pane: PaneId) -> usize {
-        match self.panes.get(&pane).map(|p| &p.content) {
-            Some(Content::Doc(d)) => d.lines.len().max(1),
-            Some(Content::Term(t)) => t.scrollbar().0.max(1),
-            None => 1,
-        }
-    }
-
     pub fn enter_copy_mode(&mut self) {
         let pane = self.layout.focus;
-        if !self.panes.contains_key(&pane) {
-            return;
-        }
-        let (w, h) = self.content_size(pane);
-        let top = self.content_top(pane);
+        let Some(rows) = self.content(pane).map(Content::rows) else { return };
+        let (_, h) = self.content_size(pane);
         // Start at the bottom-left of the view (where the newest output is).
-        let row = (top + h as usize).saturating_sub(1).min(self.content_rows(pane) - 1);
-        let _ = w;
+        let row = (self.content_top(pane) + h as usize).saturating_sub(1).min(rows - 1);
         self.copy = Some(CopyCursor { pane, pos: (row, 0), anchor: None, linewise: false });
         self.mode = Mode::Copy;
         self.selection = None;
         self.dirty = true;
     }
 
-    fn exit_copy_mode(&mut self) {
+    pub(super) fn exit_copy_mode(&mut self) {
         self.copy = None;
         self.mode = Mode::Normal;
         self.selection = None;
@@ -48,13 +37,12 @@ impl App {
 
     /// Keep the cursor's row in view by scrolling the content.
     fn reveal(&mut self, pane: PaneId, row: usize) {
-        let (_, h) = self.content_size(pane);
+        let h = self.content_size(pane).1 as usize;
         let top = self.content_top(pane);
-        let h = h as usize;
         if row < top {
-            self.scroll_pane(pane, -((top - row) as i32));
+            self.scroll_content(pane, |c| c.scroll_by(-((top - row) as i32)));
         } else if row >= top + h {
-            self.scroll_pane(pane, (row + 1 - top - h) as i32);
+            self.scroll_content(pane, |c| c.scroll_by((row + 1 - top - h) as i32));
         }
     }
 
@@ -76,12 +64,13 @@ impl App {
             self.mode = Mode::Normal;
             return Vec::new();
         };
-        let rows = self.content_rows(c.pane);
-        let (w, h) = self.content_size(c.pane);
-        let line = self.content_row_text(c.pane, c.pos.0);
-        let line_len = line.chars().count();
+        let max_row = self.content(c.pane).map_or(1, Content::rows) - 1;
+        let h = self.content_size(c.pane).1 as usize;
+        // Word and line motions work on chars; the cursor is a display column.
+        let chars: Vec<char> = self.content_row_text(c.pane, c.pos.0).chars().collect();
+        let at = col_to_char(&chars, c.pos.1);
+        let col_of = |i: usize| char_to_col(&chars, i);
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let max_row = rows - 1;
         match k.code {
             KeyCode::Char('q') => {
                 self.exit_copy_mode();
@@ -95,24 +84,24 @@ impl App {
                     return Vec::new();
                 }
             }
-            KeyCode::Char('h') | KeyCode::Left => c.pos.1 = c.pos.1.saturating_sub(1),
-            KeyCode::Char('l') | KeyCode::Right => c.pos.1 = (c.pos.1 + 1).min(w.saturating_sub(1) as usize),
+            KeyCode::Char('h') | KeyCode::Left => c.pos.1 = col_of(at.saturating_sub(1)),
+            KeyCode::Char('l') | KeyCode::Right => c.pos.1 = col_of((at + 1).min(chars.len().saturating_sub(1))),
             KeyCode::Char('k') | KeyCode::Up => c.pos.0 = c.pos.0.saturating_sub(1),
             KeyCode::Char('j') | KeyCode::Down => c.pos.0 = (c.pos.0 + 1).min(max_row),
             KeyCode::Char('0') | KeyCode::Home => c.pos.1 = 0,
-            KeyCode::Char('$') | KeyCode::End => c.pos.1 = line_len.saturating_sub(1),
-            KeyCode::Char('^') => c.pos.1 = line.chars().position(|ch| !ch.is_whitespace()).unwrap_or(0),
+            KeyCode::Char('$') | KeyCode::End => c.pos.1 = col_of(chars.len().saturating_sub(1)),
+            KeyCode::Char('^') => c.pos.1 = col_of(chars.iter().position(|ch| !ch.is_whitespace()).unwrap_or(0)),
             KeyCode::Char('g') => c.pos = (0, 0),
             KeyCode::Char('G') => c.pos = (max_row, 0),
-            KeyCode::Char('u') if ctrl => c.pos.0 = c.pos.0.saturating_sub(h as usize / 2),
-            KeyCode::Char('d') if ctrl => c.pos.0 = (c.pos.0 + h as usize / 2).min(max_row),
-            KeyCode::Char('b') if ctrl => c.pos.0 = c.pos.0.saturating_sub(h as usize),
-            KeyCode::Char('f') if ctrl => c.pos.0 = (c.pos.0 + h as usize).min(max_row),
-            KeyCode::PageUp => c.pos.0 = c.pos.0.saturating_sub(h as usize),
-            KeyCode::PageDown => c.pos.0 = (c.pos.0 + h as usize).min(max_row),
-            KeyCode::Char('w') => c.pos.1 = next_word_start(&line, c.pos.1),
-            KeyCode::Char('b') => c.pos.1 = prev_word_start(&line, c.pos.1),
-            KeyCode::Char('e') => c.pos.1 = word_end(&line, c.pos.1),
+            KeyCode::Char('u') if ctrl => c.pos.0 = c.pos.0.saturating_sub(h / 2),
+            KeyCode::Char('d') if ctrl => c.pos.0 = (c.pos.0 + h / 2).min(max_row),
+            KeyCode::Char('b') if ctrl => c.pos.0 = c.pos.0.saturating_sub(h),
+            KeyCode::Char('f') if ctrl => c.pos.0 = (c.pos.0 + h).min(max_row),
+            KeyCode::PageUp => c.pos.0 = c.pos.0.saturating_sub(h),
+            KeyCode::PageDown => c.pos.0 = (c.pos.0 + h).min(max_row),
+            KeyCode::Char('w') => c.pos.1 = col_of(next_word_start(&chars, at)),
+            KeyCode::Char('b') => c.pos.1 = col_of(prev_word_start(&chars, at)),
+            KeyCode::Char('e') => c.pos.1 = col_of(word_end(&chars, at)),
             KeyCode::Char('v') | KeyCode::Char(' ') => {
                 c.linewise = false;
                 c.anchor = if c.anchor.is_some() { None } else { Some(c.pos) };
@@ -136,29 +125,13 @@ impl App {
         self.dirty = true;
         Vec::new()
     }
-
-    pub fn resize_mode_key(&mut self, k: KeyEvent) -> Vec<Effect> {
-        let area = self.hits.pane_area;
-        const STEP: f32 = 0.05;
-        match k.code {
-            KeyCode::Char('h') | KeyCode::Left => self.layout.resize_focused(area, Dir4::Left, STEP),
-            KeyCode::Char('l') | KeyCode::Right => self.layout.resize_focused(area, Dir4::Right, STEP),
-            KeyCode::Char('k') | KeyCode::Up => self.layout.resize_focused(area, Dir4::Up, STEP),
-            KeyCode::Char('j') | KeyCode::Down => self.layout.resize_focused(area, Dir4::Down, STEP),
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('q') => self.mode = Mode::Normal,
-            _ => {}
-        }
-        self.dirty = true;
-        Vec::new()
-    }
 }
 
 fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-fn next_word_start(line: &str, col: usize) -> usize {
-    let chars: Vec<char> = line.chars().collect();
+fn next_word_start(chars: &[char], col: usize) -> usize {
     let mut i = col;
     if i >= chars.len() {
         return col;
@@ -173,8 +146,7 @@ fn next_word_start(line: &str, col: usize) -> usize {
     i.min(chars.len().saturating_sub(1))
 }
 
-fn prev_word_start(line: &str, col: usize) -> usize {
-    let chars: Vec<char> = line.chars().collect();
+fn prev_word_start(chars: &[char], col: usize) -> usize {
     let mut i = col.min(chars.len());
     while i > 0 && chars.get(i - 1).is_some_and(|c| c.is_whitespace()) {
         i -= 1;
@@ -189,8 +161,7 @@ fn prev_word_start(line: &str, col: usize) -> usize {
     i
 }
 
-fn word_end(line: &str, col: usize) -> usize {
-    let chars: Vec<char> = line.chars().collect();
+fn word_end(chars: &[char], col: usize) -> usize {
     let mut i = col + 1;
     while i < chars.len() && chars[i].is_whitespace() {
         i += 1;
@@ -211,7 +182,7 @@ mod tests {
 
     #[test]
     fn word_motions() {
-        let l = "foo bar.baz  qux";
+        let l: &[char] = &"foo bar.baz  qux".chars().collect::<Vec<_>>();
         assert_eq!(next_word_start(l, 0), 4);
         assert_eq!(next_word_start(l, 4), 7, "punctuation is its own word");
         assert_eq!(next_word_start(l, 8), 13);

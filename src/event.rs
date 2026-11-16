@@ -4,6 +4,7 @@ use ratatui::text::Line;
 
 use crate::app::inspect::ContentKey;
 use crate::docker::model::Snapshot;
+use crate::docker::ops::DockerOp;
 use crate::docker::stats::StatsSample;
 use crate::ui::layout::PaneId;
 
@@ -17,12 +18,12 @@ pub enum AppEvent {
     Doc { pane: PaneId, key: ContentKey, lines: Vec<Line<'static>> },
     /// A terminal surface produced output.
     TermActivity(PaneId),
-    /// A terminal surface's child process exited: (pane, surface id, code).
-    TermExited(PaneId, u64, Option<u32>),
+    /// A terminal surface's child process exited.
+    TermExited { pane: PaneId, surface: u64, code: Option<u32> },
     /// A container log stream ended; `clean` unless it ended with an error.
     LogsEnded { pane: PaneId, key: ContentKey, clean: bool },
     /// A docker operation finished.
-    OpDone { op: crate::docker::ops::DockerOp, desc: String, result: Result<Option<String>, String> },
+    OpDone { op: DockerOp, result: Result<Option<String>, String> },
     /// One stats sample for a container.
     Stats(String, StatsSample),
 }

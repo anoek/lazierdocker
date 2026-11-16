@@ -1,8 +1,9 @@
 //! Application state. Pure data: no terminal, no docker connection.
 //!
-//! Input handlers mutate state and return [`Effect`]s; the runtime executes
-//! effects (docker calls, spawning processes, clipboard) and feeds results back
-//! as [`AppEvent`]s.
+//! Input handlers mutate state and return [`Effect`]s. The runtime (`run`)
+//! executes them: it starts docker calls, processes and streams, installs the
+//! content they create into panes, and feeds later results back as
+//! [`AppEvent`]s.
 
 pub mod actions;
 pub mod copy_mode;
@@ -17,13 +18,16 @@ pub mod render;
 pub mod run;
 pub mod selection;
 
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
-use ratatui::layout::Rect;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::{Position, Rect};
 
-use crate::doc::DocSurface;
+pub use panes::{Content, Pane, PaneKind};
+
 use crate::docker::model::Snapshot;
+use crate::docker::ops::{is_must_stop, DockerOp};
 use crate::docker::stats::StatsHistory;
 use crate::event::AppEvent;
 use crate::term::TermSurface;
@@ -73,12 +77,29 @@ pub struct Hits {
     pub sidebar_area: Rect,
     pub sidebar_divider: Option<Rect>,
     pub pane_area: Rect,
-    /// (pane, outer rect, inner content rect)
+    /// (pane, outer rect, rect inside its frame)
     pub panes: Vec<(PaneId, Rect, Rect)>,
     pub splits: Vec<SplitBorder>,
     pub tabs: Vec<(Rect, PaneId, inspect::Tab)>,
     /// Content rect (below the tab bar) per pane.
     pub content: Vec<(PaneId, Rect)>,
+}
+
+impl Hits {
+    /// A pane's content rect at the last render.
+    pub fn content_rect(&self, pane: PaneId) -> Option<Rect> {
+        self.content.iter().find(|(p, _)| *p == pane).map(|(_, r)| *r)
+    }
+
+    /// The pane whose frame is under the pointer.
+    pub fn pane_at(&self, col: u16, row: u16) -> Option<PaneId> {
+        self.panes.iter().find(|(_, r, _)| r.contains(Position::new(col, row))).map(|(id, _, _)| *id)
+    }
+
+    /// The pane whose content is under the pointer.
+    pub fn content_at(&self, col: u16, row: u16) -> Option<PaneId> {
+        self.content.iter().find(|(_, r)| r.contains(Position::new(col, row))).map(|(id, _)| *id)
+    }
 }
 
 /// Work for the runtime. Kept as data so input handling is testable.
@@ -107,79 +128,11 @@ pub enum Effect {
         argv: Vec<String>,
     },
     /// Keep one stats stream per running container.
-    SyncStats(Vec<String>),
+    SyncStats(HashSet<String>),
     /// Put text on the system clipboard.
     Copy(String),
-    Docker(crate::docker::ops::DockerOp),
+    Docker(DockerOp),
     OpenUrl(String),
-}
-
-#[derive(Debug, Clone)]
-pub enum PaneKind {
-    /// Follows the sidebar selection.
-    Inspector,
-    /// Shows one item regardless of selection.
-    Pinned(NodeKey),
-    /// An interactive terminal (exec shell, attach, attached command).
-    Terminal { title: String },
-}
-
-#[derive(Debug)]
-pub enum Content {
-    Doc(DocSurface),
-    Term(TermSurface),
-}
-
-#[derive(Debug)]
-pub struct Pane {
-    pub kind: PaneKind,
-    /// Selected tab per item kind (lazydocker keeps the tab per panel).
-    pub tabs: HashMap<inspect::TargetKind, inspect::Tab>,
-    pub content: Content,
-    pub loaded: Option<inspect::ContentKey>,
-    /// Background task feeding this pane (log stream); aborted when replaced.
-    pub task: Option<tokio::task::AbortHandle>,
-    /// A Load for `loaded` is outstanding.
-    pub inflight: bool,
-    /// Tick of the last Load (periodic refresh of Top).
-    pub refreshed_at: u64,
-    /// The log stream for `loaded` ended cleanly at this snapshot generation;
-    /// it resumes once a newer snapshot shows the container running.
-    pub logs_ended_at: Option<u64>,
-    /// Logs show the whole history instead of the last lines (until the
-    /// pane shows something else).
-    pub full_logs: bool,
-    /// Restart the content on the next sync even though `loaded` is current.
-    pub reload: bool,
-}
-
-impl Pane {
-    pub fn new(kind: PaneKind) -> Self {
-        Self {
-            kind,
-            tabs: HashMap::new(),
-            content: Content::Doc(DocSurface::default()),
-            loaded: None,
-            task: None,
-            inflight: false,
-            refreshed_at: 0,
-            logs_ended_at: None,
-            full_logs: false,
-            reload: false,
-        }
-    }
-
-    pub fn stop_task(&mut self) {
-        if let Some(t) = self.task.take() {
-            t.abort();
-        }
-    }
-}
-
-impl Drop for Pane {
-    fn drop(&mut self) {
-        self.stop_task();
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -189,8 +142,15 @@ pub struct Click {
     pub row: u16,
 }
 
-pub const DOUBLE_CLICK: Duration = Duration::from_millis(350);
-pub const MIN_FRAME: Duration = Duration::from_millis(16);
+/// The character typed, if no modifier other than shift is held. Item
+/// actions, menu shortcuts and typed text use it, so they don't fire on
+/// ctrl/alt chords (ctrl+r is find, not restart).
+pub fn plain_char(k: &KeyEvent) -> Option<char> {
+    match k.code {
+        KeyCode::Char(c) if k.modifiers.difference(KeyModifiers::SHIFT).is_empty() => Some(c),
+        _ => None,
+    }
+}
 
 pub struct App {
     pub theme: Theme,
@@ -198,6 +158,7 @@ pub struct App {
     pub snap: Snapshot,
     /// Increments on every snapshot (summary content revision).
     pub snap_generation: u64,
+    /// The first snapshot has arrived.
     pub loaded: bool,
     pub docker_error: Option<String>,
     pub sidebar: Sidebar,
@@ -221,14 +182,14 @@ pub struct App {
     /// Transient status message.
     pub toast: Option<(String, Instant)>,
     pub overlay: Option<overlay::Overlay>,
-    /// A popup raised by a background event while a shell had focus; shown
-    /// once focus leaves the shell so it can't capture typing.
-    pub deferred: Option<overlay::Overlay>,
+    /// Popups raised by background events while a shell had focus; shown,
+    /// oldest first, once focus leaves the shell so they can't capture typing.
+    pub deferred: VecDeque<overlay::Overlay>,
     pub selection: Option<selection::Selection>,
     pub copy: Option<copy_mode::CopyCursor>,
-    /// Find in a logs pane, and the last query confirmed (enter on an empty
-    /// prompt repeats it).
+    /// Find in a logs pane.
     pub find: Option<find::Find>,
+    /// The last query confirmed (`n` / enter on an empty prompt repeat it).
     pub last_find: String,
     /// Running docker operations (status bar).
     pub pending_ops: Vec<String>,
@@ -261,7 +222,7 @@ impl App {
             layout: Layout::new(first),
             panes,
             active: None,
-            next_pane: 2,
+            next_pane: first.0 + 1,
             hits: Hits::default(),
             drag: None,
             last_click: None,
@@ -271,7 +232,7 @@ impl App {
             cursor: None,
             toast: None,
             overlay: None,
-            deferred: None,
+            deferred: VecDeque::new(),
             selection: None,
             copy: None,
             find: None,
@@ -295,23 +256,50 @@ impl App {
     pub fn rebuild_rows(&mut self) {
         self.rows = self.sidebar.rows(&self.snap);
         self.sidebar.reconcile(&self.rows);
-        // Start on the first item rather than a section header.
-        if !self.loaded {
-            return;
-        }
         self.dirty = true;
     }
 
-    pub fn live_terminal_focused(&self) -> bool {
-        self.focus == Focus::Panes
-            && matches!(self.panes.get(&self.layout.focus), Some(Pane { kind: PaneKind::Terminal { .. }, content: Content::Term(t), .. }) if t.exited().is_none())
+    /// Select `key` in the sidebar, if it has a row.
+    pub fn select_key(&mut self, key: &NodeKey) {
+        self.sidebar.select(&self.rows, key);
+        self.dirty = true;
+    }
+
+    pub fn selected(&self) -> Option<&NodeKey> {
+        self.sidebar.selected.as_ref()
+    }
+
+    /// The focused pane, when focus is in the pane area.
+    pub fn focused_pane(&self) -> Option<PaneId> {
+        (self.focus == Focus::Panes).then_some(self.layout.focus)
+    }
+
+    /// Give a pane keyboard focus.
+    pub fn focus_pane(&mut self, id: PaneId) {
+        self.focus = Focus::Panes;
+        self.layout.focus = id;
+        self.dirty = true;
+    }
+
+    /// The focused pane's terminal when it is interactive and its child is alive.
+    fn focused_live_terminal(&mut self) -> Option<&mut TermSurface> {
+        let id = self.focused_pane()?;
+        match self.panes.get_mut(&id)? {
+            Pane { kind: PaneKind::Terminal { .. }, content: Content::Term(t), .. } if t.exited().is_none() => Some(t),
+            _ => None,
+        }
+    }
+
+    fn live_terminal_focused(&self) -> bool {
+        let pane = self.focused_pane().and_then(|id| self.panes.get(&id));
+        matches!(pane, Some(Pane { kind: PaneKind::Terminal { .. }, content: Content::Term(t), .. }) if t.exited().is_none())
     }
 
     /// Show a popup that wasn't asked for by the current keystroke: deferred
-    /// while a live shell has focus.
-    pub fn raise(&mut self, ov: overlay::Overlay) {
+    /// while a live shell has focus or another popup is open.
+    fn raise(&mut self, ov: overlay::Overlay) {
         if self.live_terminal_focused() || self.overlay.is_some() {
-            self.deferred = Some(ov);
+            self.deferred.push_back(ov);
         } else {
             self.overlay = Some(ov);
         }
@@ -319,68 +307,72 @@ impl App {
     }
 
     pub fn flush_deferred(&mut self) {
-        if self.deferred.is_some() && self.overlay.is_none() && !self.live_terminal_focused() {
-            self.overlay = self.deferred.take();
+        if self.overlay.is_none() && !self.live_terminal_focused() {
+            if let Some(ov) = self.deferred.pop_front() {
+                self.overlay = Some(ov);
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Transient message in the status bar.
+    pub fn flash(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now()));
+        self.dirty = true;
+    }
+
+    pub fn show_error(&mut self, body: impl Into<String>) {
+        self.overlay = Some(overlay::Overlay::Message { title: "Error".into(), body: body.into(), error: true });
+        self.dirty = true;
+    }
+
+    pub fn content(&self, pane: PaneId) -> Option<&Content> {
+        self.panes.get(&pane).map(|p| &p.content)
+    }
+
+    /// Change how a pane's content is scrolled, and redraw.
+    pub fn scroll_content(&mut self, pane: PaneId, f: impl FnOnce(&mut Content)) {
+        if let Some(p) = self.panes.get_mut(&pane) {
+            f(&mut p.content);
             self.dirty = true;
         }
     }
 
     /// Top absolute row currently shown in a pane's content.
     pub fn content_top(&self, pane: PaneId) -> usize {
-        match self.panes.get(&pane).map(|p| &p.content) {
-            Some(Content::Doc(d)) => d.scroll,
-            Some(Content::Term(t)) => t.viewport_top(),
-            None => 0,
-        }
+        self.content(pane).map_or(0, Content::top)
     }
 
     /// Leftmost content column shown (documents scroll horizontally).
     pub fn content_left(&self, pane: PaneId) -> usize {
-        match self.panes.get(&pane).map(|p| &p.content) {
-            Some(Content::Doc(d)) => d.hscroll,
-            _ => 0,
-        }
-    }
-
-    /// Absolute (row, col) under a screen position, clamped into the pane's content.
-    pub fn content_pos(&self, pane: PaneId, col: u16, row: u16) -> Option<(usize, usize)> {
-        let (_, r) = self.hits.content.iter().find(|(p, _)| *p == pane)?;
-        if r.width == 0 || r.height == 0 {
-            return None;
-        }
-        let x = col.clamp(r.x, r.right() - 1) - r.x;
-        let y = row.clamp(r.y, r.bottom() - 1) - r.y;
-        Some((self.content_top(pane) + y as usize, self.content_left(pane) + x as usize))
+        self.content(pane).map_or(0, Content::left)
     }
 
     /// Text of an absolute content row.
     pub fn content_row_text(&self, pane: PaneId, row: usize) -> String {
-        match self.panes.get(&pane).map(|p| &p.content) {
-            Some(Content::Doc(d)) => d.line_text(row),
-            Some(Content::Term(t)) => {
-                t.text_between((row, 0), (row, self.content_size(pane).0.saturating_sub(1) as usize))
-            }
-            None => String::new(),
-        }
+        self.content(pane).map(|c| c.row_text(row)).unwrap_or_default()
     }
 
     pub fn selection_text(&self, sel: &selection::Selection) -> String {
         let (s, e) = sel.ordered();
-        match self.panes.get(&sel.pane).map(|p| &p.content) {
-            Some(Content::Doc(d)) => d.text_between(s, e),
-            Some(Content::Term(t)) => t.text_between(s, e),
-            None => String::new(),
-        }
+        self.content(sel.pane).map(|c| c.text_between(s, e)).unwrap_or_default()
+    }
+
+    /// Cell of the pane's content under a screen position, clamped into it.
+    fn content_cell(&self, pane: PaneId, col: u16, row: u16) -> Option<(u16, u16)> {
+        let r = self.hits.content_rect(pane).filter(|r| r.width > 0 && r.height > 0)?;
+        Some((col.clamp(r.x, r.right() - 1) - r.x, row.clamp(r.y, r.bottom() - 1) - r.y))
+    }
+
+    /// Absolute (row, col) under a screen position, clamped into the pane's content.
+    pub fn content_pos(&self, pane: PaneId, col: u16, row: u16) -> Option<(usize, usize)> {
+        let (x, y) = self.content_cell(pane, col, row)?;
+        Some((self.content_top(pane) + y as usize, self.content_left(pane) + x as usize))
     }
 
     /// Size of a pane's content area at the last render (default 80×24).
     pub fn content_size(&self, pane: PaneId) -> (u16, u16) {
-        self.hits
-            .content
-            .iter()
-            .find(|(p, _)| *p == pane)
-            .map(|(_, r)| (r.width.max(2), r.height.max(2)))
-            .unwrap_or((80, 24))
+        self.hits.content_rect(pane).map_or((80, 24), |r| (r.width.max(2), r.height.max(2)))
     }
 
     pub fn alloc_pane_id(&mut self) -> PaneId {
@@ -389,20 +381,16 @@ impl App {
         id
     }
 
-    pub fn selected(&self) -> Option<&NodeKey> {
-        self.sidebar.selected.as_ref()
-    }
-
     pub fn handle_app_event(&mut self, ev: AppEvent) -> Vec<Effect> {
         match ev {
             AppEvent::TermActivity(pane) => {
                 self.find_output(pane);
                 self.dirty = true;
             }
-            AppEvent::TermExited(pane, sid, code) => {
-                if let Some(Pane { content: Content::Term(t), kind, .. }) =
-                    self.panes.get_mut(&pane).filter(|p| matches!(&p.content, Content::Term(t) if t.id() == sid))
-                {
+            AppEvent::TermExited { pane, surface, code } => {
+                let found =
+                    self.panes.get_mut(&pane).filter(|p| matches!(&p.content, Content::Term(t) if t.id() == surface));
+                if let Some(Pane { content: Content::Term(t), kind, .. }) = found {
                     let what =
                         if matches!(kind, PaneKind::Terminal { .. }) { "process exited" } else { "stream ended" };
                     match code {
@@ -423,79 +411,71 @@ impl App {
                     self.dirty = true;
                 }
             }
-            AppEvent::OpDone { op, desc, result } => {
-                if let Some(i) = self.pending_ops.iter().position(|d| *d == desc) {
-                    self.pending_ops.remove(i);
-                }
-                self.dirty = true;
-                match result {
-                    Ok(Some(msg)) => self.flash(msg),
-                    Ok(None) => self.flash(format!("done: {desc}")),
-                    Err(e) => match op {
-                        crate::docker::ops::DockerOp::RemoveContainer { id, volumes, force: false }
-                            if crate::docker::ops::is_must_stop(&e) =>
-                        {
-                            let name = self.snap.container(&id).map(|c| c.name.clone()).unwrap_or(id.clone());
-                            self.raise(overlay::Overlay::Confirm {
-                                title: "Force remove".into(),
-                                body: format!("{name} is running. Stop and remove it?"),
-                                danger: true,
-                                action: actions::Action::Docker(crate::docker::ops::DockerOp::RemoveContainer {
-                                    id,
-                                    volumes,
-                                    force: true,
-                                }),
-                            });
-                        }
-                        _ => self.raise(overlay::Overlay::Message { title: "Error".into(), body: e, error: true }),
-                    },
-                }
-                return vec![Effect::RefreshNow];
-            }
+            AppEvent::OpDone { op, result } => return self.on_op_done(op, result),
             AppEvent::Stats(id, sample) => {
                 self.cpu.insert(id.clone(), sample.cpu_percent());
-                self.stats.entry(id).or_default().push(std::time::Instant::now(), sample);
+                self.stats.entry(id).or_default().push(Instant::now(), sample);
                 self.dirty = true;
             }
-            AppEvent::Snapshot(s) => {
-                let first_load = !self.loaded;
-                self.snap = *s;
-                self.snap_generation += 1;
-                self.loaded = true;
-                self.docker_error = None;
-                self.cpu.retain(|id, _| self.snap.containers.iter().any(|c| &c.id == id && c.is_running()));
-                self.stats.retain(|id, _| self.snap.containers.iter().any(|c| &c.id == id));
-                self.rebuild_rows();
-                if first_load {
-                    // Select the first leaf so the inspector has something to show.
-                    if let Some(i) = self.rows.iter().position(|r| r.depth > 0) {
-                        let key = self.rows[i].key.clone();
-                        self.sidebar.select(&self.rows, &key);
-                    }
-                }
-                self.dirty = true;
-                let running = self.snap.containers.iter().filter(|c| c.is_running()).map(|c| c.id.clone()).collect();
-                return vec![Effect::SyncStats(running)];
-            }
+            AppEvent::Snapshot(s) => return self.on_snapshot(*s),
             AppEvent::DockerError(e) => {
                 self.docker_error = Some(e);
                 self.dirty = true;
             }
             AppEvent::Doc { pane, key, lines } => {
-                if let Some(p) = self.panes.get_mut(&pane) {
-                    if p.loaded.as_ref() == Some(&key) {
-                        p.inflight = false;
-                        if let Content::Doc(d) = &mut p.content {
-                            d.set_lines(lines);
-                        } else {
-                            p.content = Content::Doc(DocSurface::new(lines));
-                        }
-                        self.dirty = true;
-                    }
+                if let Some(p) = self.panes.get_mut(&pane).filter(|p| p.loaded.as_ref() == Some(&key)) {
+                    p.inflight = false;
+                    p.show_lines(lines);
+                    self.dirty = true;
                 }
             }
         }
         Vec::new()
+    }
+
+    fn on_snapshot(&mut self, snap: Snapshot) -> Vec<Effect> {
+        let first_load = !self.loaded;
+        self.snap = snap;
+        self.snap_generation += 1;
+        self.loaded = true;
+        self.docker_error = None;
+        self.cpu.retain(|id, _| self.snap.containers.iter().any(|c| &c.id == id && c.is_running()));
+        self.stats.retain(|id, _| self.snap.containers.iter().any(|c| &c.id == id));
+        self.rebuild_rows();
+        if first_load {
+            // Start on the first item rather than a section header, so the
+            // inspector has something to show.
+            if let Some(key) = self.rows.iter().find(|r| r.depth > 0).map(|r| r.key.clone()) {
+                self.select_key(&key);
+            }
+        }
+        let running = self.snap.containers.iter().filter(|c| c.is_running()).map(|c| c.id.clone()).collect();
+        vec![Effect::SyncStats(running)]
+    }
+
+    fn on_op_done(&mut self, op: DockerOp, result: Result<Option<String>, String>) -> Vec<Effect> {
+        let desc = op.describe();
+        if let Some(i) = self.pending_ops.iter().position(|d| *d == desc) {
+            self.pending_ops.remove(i);
+        }
+        match result {
+            Ok(Some(msg)) => self.flash(msg),
+            Ok(None) => self.flash(format!("done: {desc}")),
+            Err(e) => match op {
+                // lazydocker offers to force-remove a running container.
+                DockerOp::RemoveContainer { id, volumes, force: false } if is_must_stop(&e) => {
+                    let name = self.container_name(&id);
+                    self.raise(overlay::Overlay::Confirm {
+                        title: "Force remove".into(),
+                        body: format!("{name} is running. Stop and remove it?"),
+                        danger: true,
+                        action: actions::Action::Docker(DockerOp::RemoveContainer { id, volumes, force: true }),
+                    });
+                }
+                _ => self.raise(overlay::Overlay::Message { title: "Error".into(), body: e, error: true }),
+            },
+        }
+        vec![Effect::RefreshNow]
     }
 }
 

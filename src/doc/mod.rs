@@ -1,4 +1,5 @@
-//! Read-only "document" surface: styled lines with vertical scroll.
+//! Read-only "document" surface: styled lines that scroll both ways, with
+//! text extraction for selections.
 
 pub mod format;
 pub mod graph;
@@ -7,7 +8,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
+
+use crate::ui::text::col_to_char;
 
 #[derive(Debug, Clone, Default)]
 pub struct DocSurface {
@@ -17,7 +20,8 @@ pub struct DocSurface {
     pub hscroll: usize,
     /// Width at the last render.
     pub view_width: usize,
-    /// Keep the view pinned to the bottom as lines arrive.
+    /// Stay at the bottom when the content is replaced (Top refreshes); set
+    /// by scrolling to the end, cleared by scrolling up.
     pub follow: bool,
     /// Height at the last render (for page scrolling and clamping).
     pub view_height: usize,
@@ -25,7 +29,7 @@ pub struct DocSurface {
 
 impl DocSurface {
     pub fn new(lines: Vec<Line<'static>>) -> Self {
-        Self { lines, ..Default::default() }
+        Self { lines: printable(lines), ..Default::default() }
     }
 
     pub fn message(text: impl Into<String>) -> Self {
@@ -34,8 +38,9 @@ impl DocSurface {
 
     /// Replace content, keeping the scroll position when possible.
     pub fn set_lines(&mut self, lines: Vec<Line<'static>>) {
-        self.lines = lines;
+        self.lines = printable(lines);
         self.clamp();
+        self.hscroll = self.hscroll.min(self.max_hscroll());
     }
 
     fn max_scroll(&self) -> usize {
@@ -60,9 +65,12 @@ impl DocSurface {
         self.lines.iter().map(|l| l.width()).max().unwrap_or(0)
     }
 
+    fn max_hscroll(&self) -> usize {
+        self.max_line_width().saturating_sub(self.view_width.max(1))
+    }
+
     pub fn hscroll_by(&mut self, delta: i32) {
-        let max = self.max_line_width().saturating_sub(self.view_width.max(1));
-        self.hscroll = (self.hscroll as i64 + delta as i64).clamp(0, max as i64) as usize;
+        self.hscroll = (self.hscroll as i64 + delta as i64).clamp(0, self.max_hscroll() as i64) as usize;
     }
 
     pub fn scroll_top(&mut self) {
@@ -70,8 +78,10 @@ impl DocSurface {
         self.follow = false;
     }
 
+    /// Scroll to the end and stay there as content is replaced.
     pub fn scroll_bottom(&mut self) {
         self.scroll = self.max_scroll();
+        self.follow = true;
     }
 
     pub fn render(&mut self, buf: &mut Buffer, area: Rect) {
@@ -81,26 +91,27 @@ impl DocSurface {
         let marker = Style::default().fg(Color::DarkGray);
         for (i, line) in self.lines.iter().skip(self.scroll).take(area.height as usize).enumerate() {
             let y = area.y + i as u16;
-            if self.hscroll == 0 {
-                buf.set_line(area.x, y, line, area.width);
-            } else {
-                // Draw cell by cell, skipping the first `hscroll` columns.
-                let mut col = 0usize;
-                let mut x = area.x;
-                'spans: for span in &line.spans {
-                    let style = line.style.patch(span.style);
-                    for ch in span.content.chars() {
-                        let w = ch.width().unwrap_or(0);
-                        if col >= self.hscroll {
-                            if x + w as u16 > area.right() {
-                                break 'spans;
-                            }
-                            buf[(x, y)].set_char(ch).set_style(style);
-                            x += w as u16;
-                        }
-                        col += w;
-                    }
+            // As `Buffer::set_line` draws, but skipping the first `hscroll` columns.
+            let mut col = 0usize;
+            let mut x = area.x;
+            for g in line.styled_graphemes(Style::default()) {
+                let (symbol, style) = (g.symbol, g.style);
+                let w = symbol.width();
+                if w == 0 {
+                    continue;
                 }
+                if col >= self.hscroll {
+                    if x as usize + w > area.right() as usize {
+                        break;
+                    }
+                    buf[(x, y)].set_symbol(symbol).set_style(style);
+                    // A wide symbol hides the cells it covers.
+                    for hidden in x + 1..x + w as u16 {
+                        buf[(hidden, y)].reset();
+                    }
+                    x += w as u16;
+                }
+                col += w;
             }
             if line.width() > self.hscroll + area.width as usize && area.width > 0 {
                 buf[(area.right() - 1, y)].set_symbol("›").set_style(marker);
@@ -122,26 +133,31 @@ impl DocSurface {
             let text = self.line_text(row);
             let chars: Vec<char> = text.chars().collect();
             let from = if row == start.0 { col_to_char(&chars, start.1) } else { 0 };
-            let to = if row == end.0 { col_to_char(&chars, end.1 + 1) } else { chars.len() };
-            let piece: String =
-                chars[from.min(chars.len())..to.min(chars.len()).max(from.min(chars.len()))].iter().collect();
+            let to = if row == end.0 { (col_to_char(&chars, end.1) + 1).min(chars.len()) } else { chars.len() };
+            let piece: String = chars[from..to.max(from)].iter().collect();
             out.push(piece.trim_end().to_string());
         }
         out.join("\n")
     }
 }
 
-/// Convert a display column to a char index (accounting for wide chars).
-pub fn col_to_char(chars: &[char], col: usize) -> usize {
-    use unicode_width::UnicodeWidthChar;
-    let mut w = 0;
-    for (i, c) in chars.iter().enumerate() {
-        if w >= col {
-            return i;
+/// Make lines safe to draw: inspect strings carry tabs and newlines, which
+/// a terminal cell can't show. Tabs become spaces; other controls are escaped.
+fn printable(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    for span in lines.iter_mut().flat_map(|l| l.spans.iter_mut()) {
+        if span.content.contains(char::is_control) {
+            let mut clean = String::with_capacity(span.content.len());
+            for c in span.content.chars() {
+                match c {
+                    '\t' => clean.push_str("    "),
+                    c if c.is_control() => clean.extend(c.escape_default()),
+                    c => clean.push(c),
+                }
+            }
+            span.content = clean.into();
         }
-        w += c.width().unwrap_or(0);
     }
-    chars.len()
+    lines
 }
 
 #[cfg(test)]
@@ -194,10 +210,27 @@ mod tests {
     }
 
     #[test]
+    fn control_chars_are_made_visible_and_wide_chars_scroll() {
+        let mut d = DocSurface::new(vec![Line::from(ratatui::text::Span::raw("a\tb\n")), Line::raw("日本語abc")]);
+        assert_eq!(d.line_text(0), "a    b\\n");
+        let area = Rect::new(0, 0, 8, 2);
+        let mut buf = Buffer::empty(area);
+        d.hscroll_by(2);
+        d.render(&mut buf, area);
+        let row = |y| (0..8).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>();
+        assert_eq!(row(0), "   b\\n  ");
+        assert_eq!(row(1), "本 語 abc ", "a wide char takes two cells (the second kept blank)");
+    }
+
+    #[test]
     fn text_between_stream_selection() {
         let d = DocSurface::new(vec![Line::raw("hello world"), Line::raw("second line"), Line::raw("third")]);
         assert_eq!(d.text_between((0, 6), (1, 5)), "world\nsecond");
         assert_eq!(d.text_between((1, 5), (0, 6)), "world\nsecond", "reversed order");
         assert_eq!(d.text_between((2, 0), (2, 99)), "third");
+        // A selection starting or ending on either half of a wide char includes it.
+        let d = DocSurface::new(vec![Line::raw("a日b")]);
+        assert_eq!(d.text_between((0, 2), (0, 3)), "日b");
+        assert_eq!(d.text_between((0, 0), (0, 1)), "a日");
     }
 }

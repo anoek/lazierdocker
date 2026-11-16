@@ -1,18 +1,20 @@
 //! Runs only when LAZIERDOCKER_TEST_DOCKER_HOST points at a disposable daemon
-//! (see docs: docker-in-docker fixture with the `demo` compose project).
+//! (README § Testing: a docker-in-docker daemon with the `demo` compose project).
 
 use lazierdocker::docker::client::Docker;
 
+/// The disposable daemon, or None (and a note) when the test should be skipped.
 fn test_host() -> Option<String> {
-    std::env::var("LAZIERDOCKER_TEST_DOCKER_HOST").ok().filter(|s| !s.is_empty())
+    let host = std::env::var("LAZIERDOCKER_TEST_DOCKER_HOST").ok().filter(|s| !s.is_empty());
+    if host.is_none() {
+        eprintln!("skipped: LAZIERDOCKER_TEST_DOCKER_HOST not set");
+    }
+    host
 }
 
 #[tokio::test]
 async fn snapshot_sees_demo_project() {
-    let Some(host) = test_host() else {
-        eprintln!("skipped: LAZIERDOCKER_TEST_DOCKER_HOST not set");
-        return;
-    };
+    let Some(host) = test_host() else { return };
     let docker = Docker::connect_to(&host).unwrap();
     let snap = docker.snapshot(None).await.unwrap();
     let demo = snap.project("demo").expect("demo project");

@@ -1,3 +1,6 @@
+//! Smoke test of the libghostty-vt binding on its own, so a build or link
+//! problem with the native library shows up here rather than deep in app tests.
+
 use libghostty_vt::terminal::{Point, PointCoordinate};
 use libghostty_vt::{Terminal, TerminalOptions};
 

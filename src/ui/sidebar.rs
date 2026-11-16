@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 
 use crate::docker::model::{Container, ContainerState, Snapshot};
 use crate::docker::present;
-use crate::ui::borders::truncate;
+use crate::ui::text::truncate;
 use crate::ui::theme::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -81,6 +81,8 @@ pub struct Sidebar {
     /// neighbour when the selected item disappears.
     pub selected_index: usize,
     pub scroll: usize,
+    /// The selection (key and row) last scrolled into view (see `render`).
+    revealed: Option<(NodeKey, usize)>,
     pub filter: String,
     pub show_exited: bool,
     pub width: u16,
@@ -101,6 +103,7 @@ impl Default for Sidebar {
             selected: None,
             selected_index: 0,
             scroll: 0,
+            revealed: None,
             filter: String::new(),
             show_exited: true,
             width: DEFAULT_WIDTH,
@@ -119,51 +122,58 @@ pub fn section_of(key: &NodeKey) -> Section {
     }
 }
 
-fn container_visible(c: &Container, show_exited: bool) -> bool {
-    show_exited || c.state != ContainerState::Exited
+/// Standalone containers the Containers section lists (`e` hides exited ones).
+fn visible_containers(snap: &Snapshot, show_exited: bool) -> impl Iterator<Item = &Container> {
+    snap.standalone_containers().filter(move |c| show_exited || c.state != ContainerState::Exited)
 }
 
-impl Sidebar {
-    fn is_expanded(&self, key: &NodeKey) -> bool {
-        !self.filter.is_empty() || !self.collapsed.contains(key)
+/// A node of the full resource tree, before filtering and collapsing.
+struct TreeItem {
+    row: Row,
+    children: Vec<TreeItem>,
+}
+
+impl TreeItem {
+    fn leaf(key: NodeKey, depth: u8, label: String) -> Self {
+        let row = Row { key, depth, expandable: false, expanded: false, last_child: false, label };
+        Self { row, children: Vec::new() }
     }
 
-    /// Flatten the visible tree.
-    pub fn rows(&self, snap: &Snapshot) -> Vec<Row> {
-        // Build the full tree first as (row, children) then filter/collapse.
-        struct Item {
-            row: Row,
-            children: Vec<Item>,
-        }
-        let leaf = |key: NodeKey, depth: u8, label: String| Item {
-            row: Row { key, depth, expandable: false, expanded: false, last_child: false, label },
-            children: vec![],
-        };
-        let mut sections = Vec::new();
-        for section in Section::ALL {
-            let children: Vec<Item> = match section {
+    fn branch(key: NodeKey, depth: u8, label: String, children: Vec<TreeItem>) -> Self {
+        let mut item = Self::leaf(key, depth, label);
+        item.row.expandable = true;
+        item.children = children;
+        item
+    }
+
+    /// The item or one of its descendants matches the (lowercase) filter.
+    fn matches(&self, needle: &str) -> bool {
+        needle.is_empty()
+            || self.row.label.to_lowercase().contains(needle)
+            || self.children.iter().any(|c| c.matches(needle))
+    }
+}
+
+/// Every section with its items (Projects ▸ services; the rest flat).
+fn tree(snap: &Snapshot, show_exited: bool) -> Vec<TreeItem> {
+    let leaf = TreeItem::leaf;
+    Section::ALL
+        .into_iter()
+        .map(|section| {
+            let children = match section {
                 Section::Projects => snap
                     .projects
                     .iter()
-                    .map(|p| Item {
-                        row: Row {
-                            key: NodeKey::Project(p.name.clone()),
-                            depth: 1,
-                            expandable: true,
-                            expanded: false,
-                            last_child: false,
-                            label: p.name.clone(),
-                        },
-                        children: p
+                    .map(|p| {
+                        let services = p
                             .services
                             .iter()
                             .map(|s| leaf(NodeKey::Service(p.name.clone(), s.name.clone()), 2, s.name.clone()))
-                            .collect(),
+                            .collect();
+                        TreeItem::branch(NodeKey::Project(p.name.clone()), 1, p.name.clone(), services)
                     })
                     .collect(),
-                Section::Containers => snap
-                    .standalone_containers()
-                    .filter(|c| container_visible(c, self.show_exited))
+                Section::Containers => visible_containers(snap, show_exited)
                     .map(|c| leaf(NodeKey::Container(c.id.clone()), 1, c.name.clone()))
                     .collect(),
                 Section::Images => {
@@ -176,52 +186,43 @@ impl Sidebar {
                     snap.networks.iter().map(|n| leaf(NodeKey::Network(n.id.clone()), 1, n.name.clone())).collect()
                 }
             };
-            sections.push(Item {
-                row: Row {
-                    key: NodeKey::Section(section),
-                    depth: 0,
-                    expandable: true,
-                    expanded: false,
-                    last_child: false,
-                    label: section.title().to_string(),
-                },
-                children,
-            });
-        }
+            TreeItem::branch(NodeKey::Section(section), 0, section.title().to_string(), children)
+        })
+        .collect()
+}
 
+impl Sidebar {
+    fn is_expanded(&self, key: &NodeKey) -> bool {
+        !self.filter.is_empty() || !self.collapsed.contains(key)
+    }
+
+    /// Flatten the visible tree.
+    pub fn rows(&self, snap: &Snapshot) -> Vec<Row> {
         let needle = self.filter.to_lowercase();
-        fn matches(item: &Item, needle: &str) -> bool {
-            needle.is_empty()
-                || item.row.label.to_lowercase().contains(needle)
-                || item.children.iter().any(|c| matches(c, needle))
-        }
-        fn emit(item: Item, sb: &Sidebar, needle: &str, out: &mut Vec<Row>, is_last: bool) {
-            let Item { mut row, children } = item;
-            row.last_child = is_last;
-            row.expanded = row.expandable && sb.is_expanded(&row.key);
-            let expanded = row.expanded;
-            let depth = row.depth;
-            out.push(row);
-            if expanded {
-                // While filtering, a matching parent shows all its children.
-                let self_match =
-                    !needle.is_empty() && out.last().is_some_and(|r| r.label.to_lowercase().contains(needle));
-                let kids: Vec<Item> = children
-                    .into_iter()
-                    .filter(|c| depth == 0 && needle.is_empty() || self_match && depth > 0 || matches(c, needle))
-                    .collect();
-                let n = kids.len();
-                for (i, c) in kids.into_iter().enumerate() {
-                    emit(c, sb, needle, out, i + 1 == n);
-                }
-            }
-        }
         let mut out = Vec::new();
-        for s in sections {
-            // Sections stay visible while filtering so the tree keeps its shape.
-            emit(s, self, &needle, &mut out, false);
+        // Sections stay visible while filtering so the tree keeps its shape.
+        for section in tree(snap, self.show_exited) {
+            self.emit(section, &needle, false, &mut out);
         }
         out
+    }
+
+    fn emit(&self, item: TreeItem, needle: &str, last_child: bool, out: &mut Vec<Row>) {
+        let TreeItem { mut row, children } = item;
+        row.last_child = last_child;
+        row.expanded = row.expandable && self.is_expanded(&row.key);
+        // While filtering, a matching group (not a section) shows all its children.
+        let show_all = row.depth > 0 && !needle.is_empty() && row.label.to_lowercase().contains(needle);
+        let expanded = row.expanded;
+        out.push(row);
+        if !expanded {
+            return;
+        }
+        let kids: Vec<TreeItem> = children.into_iter().filter(|c| show_all || c.matches(needle)).collect();
+        let n = kids.len();
+        for (i, c) in kids.into_iter().enumerate() {
+            self.emit(c, needle, i + 1 == n, out);
+        }
     }
 
     /// Re-anchor the selection after a refresh: keep the key if still visible,
@@ -238,7 +239,7 @@ impl Sidebar {
                 return;
             }
         }
-        // The item vanished: pick the nearest row at or before its old position within
+        // The item vanished: pick the row now at its old position, kept within
         // the same section, falling back to that section's header.
         let i = match self.selected.as_ref().map(section_of) {
             Some(section) => {
@@ -280,11 +281,12 @@ impl Sidebar {
         }
     }
 
-    pub fn set_expanded(&mut self, key: &NodeKey, expanded: bool) {
+    /// Expand or collapse a group; true if that changed it.
+    pub fn set_expanded(&mut self, key: &NodeKey, expanded: bool) -> bool {
         if expanded {
-            self.collapsed.remove(key);
+            self.collapsed.remove(key)
         } else {
-            self.collapsed.insert(key.clone());
+            self.collapsed.insert(key.clone())
         }
     }
 
@@ -296,7 +298,7 @@ impl Sidebar {
     }
 
     /// Make sure the selection is within the visible window.
-    pub fn ensure_visible(&mut self, height: usize) {
+    fn ensure_visible(&mut self, height: usize) {
         if height == 0 {
             return;
         }
@@ -331,9 +333,6 @@ impl Sidebar {
             return hits;
         }
         // The divider is drawn by the pane frames to our right; we own [x, right).
-        let inner = area;
-        let div_x = area.right() - 1;
-        // Header.
         let header = if ctx.filter_editing || !self.filter.is_empty() {
             Line::from(vec![
                 Span::styled(" / ", Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
@@ -346,10 +345,18 @@ impl Sidebar {
                 Style::default().fg(t.overlay1).add_modifier(Modifier::BOLD),
             )])
         };
-        buf.set_line(inner.x, inner.y, &header, inner.width);
-        let list = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
+        buf.set_line(area.x, area.y, &header, area.width);
+        let list = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
         hits.list_area = list;
         let height = list.height as usize;
+        // Scroll to the selection whenever it or its row changes, however that
+        // happened (keys, filter, new rows above it, a focused pane); the wheel
+        // changes neither, so it can still scroll the selection out of view.
+        let current = self.selected.clone().map(|k| (k, self.selected_index));
+        if current != self.revealed {
+            self.ensure_visible(height);
+            self.revealed = current;
+        }
         self.scroll = self.scroll.min(rows.len().saturating_sub(height));
 
         for (i, row) in rows.iter().enumerate().skip(self.scroll).take(height) {
@@ -366,46 +373,72 @@ impl Sidebar {
                 Style::default().fg(t.subtext0)
             };
             buf.set_style(rect, base);
-            let (spans, right, toggle_col) = row_spans(row, ctx);
-            let mut line = Line::from(spans);
-            line = line.patch_style(base.remove_modifier(Modifier::empty()));
-            // Right-aligned extra (cpu / size / driver).
-            let right_w =
-                right.as_ref().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()) as u16).unwrap_or(0);
+            let (spans, right, toggle_col) = row_spans(row, ctx, self.show_exited);
+            let line = Line::from(spans).patch_style(base);
+            // Right-aligned extra (cpu / size / driver), dropped when the row is narrow.
+            let right_w = right.as_ref().map_or(0, |s| s.width() as u16);
             let left_max = if right_w > 0 && list.width > right_w + 12 { list.width - right_w - 1 } else { list.width };
             buf.set_line(list.x, y, &line, left_max);
-            if let Some(r) = right {
-                if left_max < list.width {
-                    let mut s = r;
-                    if selected {
-                        s.style = s.style.bg(if ctx.focused { t.surface0 } else { t.active_row_bg });
-                    }
-                    buf.set_span(list.right() - right_w, y, &s, right_w);
+            if let Some(mut r) = right.filter(|_| left_max < list.width) {
+                if let Some(bg) = base.bg {
+                    r.style = r.style.bg(bg);
                 }
+                buf.set_span(list.x + list.width - right_w, y, &r, right_w);
             }
             hits.rows.push((rect, row.key.clone()));
             if let Some(col) = toggle_col {
                 hits.toggles.push((Rect::new(list.x + col, y, 2, 1), row.key.clone()));
             }
         }
-        // Scrollbar hint when content overflows.
-        if rows.len() > height && height > 0 {
-            let thumb_h = ((height * height) / rows.len()).max(1);
-            let max_scroll = rows.len() - height;
-            let thumb_y = (self.scroll * (height - thumb_h)).checked_div(max_scroll).unwrap_or(0);
-            for dy in 0..height {
-                let on = dy >= thumb_y && dy < thumb_y + thumb_h;
-                buf[(div_x, list.y + dy as u16)]
-                    .set_symbol(if on { "┃" } else { "│" })
-                    .set_style(Style::default().fg(if on { t.overlay0 } else { t.surface1 }));
+        hits
+    }
+
+    /// Draw the list's scroll thumb on the divider at column `x` (drawn by the
+    /// pane frames), leaving its junction glyphs alone.
+    pub fn draw_scrollbar(&self, buf: &mut Buffer, x: u16, list: Rect, rows: usize) {
+        let height = list.height as usize;
+        if rows <= height || height == 0 || !buf.area.contains((x, list.y).into()) {
+            return;
+        }
+        let thumb_h = ((height * height) / rows).max(1);
+        let thumb_y = self.scroll * (height - thumb_h) / (rows - height);
+        for dy in thumb_y..(thumb_y + thumb_h).min(height) {
+            let cell = &mut buf[(x, list.y + dy as u16)];
+            if cell.symbol() == "│" {
+                cell.set_symbol("┃");
             }
         }
-        hits
+    }
+}
+
+/// Icon, name and substatus of a container row; returns its CPU span when running.
+fn container_spans(
+    c: &Container,
+    name: String,
+    ctx: &RenderCtx<'_>,
+    spans: &mut Vec<Span<'static>>,
+) -> Option<Span<'static>> {
+    let t = ctx.theme;
+    spans.push(Span::styled(present::state_icon(c.state), Style::default().fg(present::state_color(c, t))));
+    spans.push(Span::raw(" "));
+    spans.push(Span::raw(name));
+    if let Some(sub) = present::substatus(c, t) {
+        spans.push(Span::raw(" "));
+        spans.push(sub);
+    }
+    if c.state == ContainerState::Running {
+        ctx.cpu.get(&c.id).map(|v| present::cpu_span(*v, t))
+    } else {
+        None
     }
 }
 
 /// Returns (left spans, optional right-aligned span, toggle column offset).
-fn row_spans(row: &Row, ctx: &RenderCtx<'_>) -> (Vec<Span<'static>>, Option<Span<'static>>, Option<u16>) {
+fn row_spans(
+    row: &Row,
+    ctx: &RenderCtx<'_>,
+    show_exited: bool,
+) -> (Vec<Span<'static>>, Option<Span<'static>>, Option<u16>) {
     let t = ctx.theme;
     let snap = ctx.snap;
     let caret = |expanded: bool| if expanded { "▾ " } else { "▸ " };
@@ -420,7 +453,7 @@ fn row_spans(row: &Row, ctx: &RenderCtx<'_>) -> (Vec<Span<'static>>, Option<Span
             spans.push(Span::styled(s.title().to_string(), Style::default().fg(t.text).add_modifier(Modifier::BOLD)));
             let count = match s {
                 Section::Projects => snap.projects.len(),
-                Section::Containers => snap.standalone_containers().count(),
+                Section::Containers => visible_containers(snap, show_exited).count(),
                 Section::Images => snap.images.len(),
                 Section::Volumes => snap.volumes.len(),
                 Section::Networks => snap.networks.len(),
@@ -453,21 +486,7 @@ fn row_spans(row: &Row, ctx: &RenderCtx<'_>) -> (Vec<Span<'static>>, Option<Span
             let c =
                 snap.service(project, name).and_then(|s| s.container_id.as_deref()).and_then(|id| snap.container(id));
             match c {
-                Some(c) => {
-                    spans.push(Span::styled(
-                        present::state_icon(c.state),
-                        Style::default().fg(present::state_color(c, t)),
-                    ));
-                    spans.push(Span::raw(" "));
-                    spans.push(Span::raw(name.clone()));
-                    if let Some(sub) = present::substatus(c, t) {
-                        spans.push(Span::raw(" "));
-                        spans.push(sub);
-                    }
-                    if c.state == ContainerState::Running {
-                        right = ctx.cpu.get(&c.id).map(|v| present::cpu_span(*v, t));
-                    }
-                }
+                Some(c) => right = container_spans(c, name.clone(), ctx, &mut spans),
                 None => {
                     spans.push(Span::styled("·", Style::default().fg(t.blue)));
                     spans.push(Span::raw(" "));
@@ -478,21 +497,12 @@ fn row_spans(row: &Row, ctx: &RenderCtx<'_>) -> (Vec<Span<'static>>, Option<Span
         NodeKey::Container(id) => {
             spans.push(Span::raw("  "));
             if let Some(c) = snap.container(id) {
-                spans.push(Span::styled(present::state_icon(c.state), Style::default().fg(present::state_color(c, t))));
-                spans.push(Span::raw(" "));
-                spans.push(Span::raw(c.name.clone()));
-                if let Some(sub) = present::substatus(c, t) {
-                    spans.push(Span::raw(" "));
-                    spans.push(sub);
-                }
-                if c.state == ContainerState::Running {
-                    right = ctx.cpu.get(&c.id).map(|v| present::cpu_span(*v, t));
-                }
+                right = container_spans(c, c.name.clone(), ctx, &mut spans);
             }
         }
         NodeKey::Image(id) => {
             spans.push(Span::raw("  "));
-            if let Some(i) = snap.images.iter().find(|i| &i.id == id) {
+            if let Some(i) = snap.image(id) {
                 spans.push(Span::raw(i.name.clone()));
                 if !i.tag.is_empty() {
                     spans.push(Span::styled(format!(":{}", i.tag), dim));
@@ -509,7 +519,7 @@ fn row_spans(row: &Row, ctx: &RenderCtx<'_>) -> (Vec<Span<'static>>, Option<Span
         }
         NodeKey::Network(id) => {
             spans.push(Span::raw("  "));
-            if let Some(n) = snap.networks.iter().find(|n| &n.id == id) {
+            if let Some(n) = snap.network(id) {
                 spans.push(Span::raw(n.name.clone()));
                 right = Some(Span::styled(n.driver.clone(), dim));
             }
@@ -534,14 +544,7 @@ mod tests {
         Snapshot {
             projects: derive_projects(&containers, None),
             containers,
-            images: vec![Image {
-                id: "sha256:1".into(),
-                name: "nginx".into(),
-                tag: "alpine".into(),
-                size: 1,
-                created: 0,
-                containers: 1,
-            }],
+            images: vec![Image { id: "sha256:1".into(), name: "nginx".into(), tag: "alpine".into(), size: 1 }],
             volumes: vec![Volume { name: "demo_dbdata".into(), driver: "local".into(), labelled: true }],
             networks: vec![Network { id: "n1".into(), name: "bridge".into(), driver: "bridge".into() }],
         }
@@ -662,7 +665,8 @@ mod tests {
         let mut sb = Sidebar::default();
         let s = snap();
         let rows = sb.rows(&s);
-        let cpu = HashMap::new();
+        let loner = s.containers.iter().find(|c| c.name == "loner").unwrap().id.clone();
+        let cpu = HashMap::from([(loner, 12.5)]);
         let theme = Theme::default();
         let area = Rect::new(0, 0, 30, 8);
         let mut buf = Buffer::empty(area);
@@ -672,7 +676,22 @@ mod tests {
         assert_eq!(hits.rows.len(), 7, "header takes one row");
         let line1: String = (0..29).map(|x| buf[(x, 1)].symbol().to_string()).collect();
         assert!(line1.starts_with("▾ Projects 1"), "{line1:?}");
-        assert_eq!(buf[(29, 3)].symbol(), "┃", "scrollbar thumb on divider");
+        let loner_row: String = (0..30).map(|x| buf[(x, 6)].symbol().to_string()).collect();
+        assert!(loner_row.trim_end().ends_with("12.50%"), "right-aligned CPU: {loner_row:?}");
         assert_eq!(hits.toggles[0].1, NodeKey::Section(Section::Projects));
+    }
+
+    #[test]
+    fn scroll_thumb_sits_on_the_divider() {
+        let sb = Sidebar::default();
+        let area = Rect::new(0, 0, 3, 10);
+        let mut buf = Buffer::empty(area);
+        for y in 0..10 {
+            buf[(2, y)].set_symbol(if y == 5 { "├" } else { "│" });
+        }
+        let list = Rect::new(0, 1, 2, 8);
+        sb.draw_scrollbar(&mut buf, 2, list, 16);
+        let col: Vec<&str> = (0..10).map(|y| buf[(2, y)].symbol()).collect();
+        assert_eq!(col, ["│", "┃", "┃", "┃", "┃", "├", "│", "│", "│", "│"], "thumb at the top, junction kept");
     }
 }

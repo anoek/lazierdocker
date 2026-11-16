@@ -2,6 +2,13 @@
 
 Date: 2026-11-16 · Status: approved to build (user delegated design; kickoff decisions recorded below)
 
+> **Historical.** This is the design as agreed before the first cut. The code and README are the
+> reference where they differ. Known differences: libghostty-vt now comes from the crates.io
+> `libghostty-vt` crate (nothing is vendored); the sidebar's maximum width is 80; log streams,
+> compose command templates and inspector loading live in `src/app/` (`run.rs`, `docker_actions.rs`,
+> `loader.rs`), with stats streams in `src/docker/stats.rs`; there is no separate `input/` module
+> (keys and mouse are in `src/app/input.rs`, the clipboard in `src/clipboard.rs`).
+
 ## Intent
 A Rust TUI for managing Docker with **lazydocker's feature set** (business logic) and **herdr's
 terminal interaction model** (mouse-first, copy/paste, border-drag resizing, hierarchical

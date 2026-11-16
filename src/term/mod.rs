@@ -14,7 +14,7 @@ use std::cell::{RefCell, RefMut};
 use std::io::{Read, Write};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -32,11 +32,13 @@ pub use libghostty_vt::key::Mods;
 pub use libghostty_vt::mouse::{Action as MouseAction, Button as MouseButton};
 
 /// `TERM` for children: every container image has xterm-256color's terminfo.
-pub const TERM: &str = "xterm-256color";
+const TERM: &str = "xterm-256color";
 /// Scrollback budget per terminal, in bytes. libghostty-vt's header calls
 /// `max_scrollback` a line count, but Ghostty passes it to the page list as a
 /// byte limit (`PageList.max_size`).
-pub const SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
+const SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
+/// Smallest terminal size; libghostty and PTYs reject zero.
+const MIN_SIZE: u16 = 2;
 /// Most bytes parsed per drain, so a flooding child cannot stall a frame.
 const DRAIN_BUDGET: usize = 4 * 1024 * 1024;
 
@@ -46,12 +48,12 @@ pub type OnExit = Arc<dyn Fn(u64, Option<u32>) + Send + Sync>;
 
 static NEXT_SURFACE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-pub(crate) struct Core {
-    pub term: Terminal<'static, 'static>,
-    pub rs: RenderState<'static>,
-    pub keys: KeyEncoder<'static>,
-    pub rows: RowIterator<'static>,
-    pub cells: CellIterator<'static>,
+struct Core {
+    term: Terminal<'static, 'static>,
+    rs: RenderState<'static>,
+    keys: KeyEncoder<'static>,
+    rows: RowIterator<'static>,
+    cells: CellIterator<'static>,
 }
 
 /// Feeds bytes into a terminal from another thread (logs streams).
@@ -74,7 +76,7 @@ impl Feeder {
 }
 
 /// Convert lone `\n` into `\r\n` so non-TTY output starts each line at column 0.
-pub fn normalise_lf(bytes: &[u8]) -> Vec<u8> {
+fn normalise_lf(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 16);
     let mut prev = 0u8;
     for &b in bytes {
@@ -117,9 +119,12 @@ fn err(what: &str) -> impl FnOnce(libghostty_vt::Error) -> anyhow::Error + '_ {
 }
 
 fn new_core(cols: u16, rows: u16, replies: Rc<RefCell<Vec<u8>>>) -> Result<Core> {
-    let mut term =
-        Terminal::new(TerminalOptions { cols: cols.max(1), rows: rows.max(1), max_scrollback: SCROLLBACK_BYTES })
-            .map_err(err("terminal"))?;
+    let mut term = Terminal::new(TerminalOptions {
+        cols: cols.max(MIN_SIZE),
+        rows: rows.max(MIN_SIZE),
+        max_scrollback: SCROLLBACK_BYTES,
+    })
+    .map_err(err("terminal"))?;
     term.on_pty_write(move |_, b| replies.borrow_mut().extend_from_slice(b)).map_err(err("callback"))?;
     Ok(Core {
         term,
@@ -161,7 +166,7 @@ impl TermSurface {
         wake: Wake,
         on_exit: OnExit,
     ) -> Result<Self> {
-        let (cols, rows) = (cols.max(2), rows.max(2));
+        let (cols, rows) = (cols.max(MIN_SIZE), rows.max(MIN_SIZE));
         let mut me = Self::stream(cols, rows, wake.clone())?;
         let pair = native_pty_system()
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -233,7 +238,7 @@ impl TermSurface {
     }
 
     /// The terminal, with all queued output parsed and its replies sent.
-    pub(crate) fn core(&self) -> RefMut<'_, Core> {
+    fn core(&self) -> RefMut<'_, Core> {
         let mut core = self.core.borrow_mut();
         let mut parsed = 0;
         while parsed < DRAIN_BUDGET {
@@ -242,7 +247,7 @@ impl TermSurface {
                     core.term.vt_write(&bytes);
                     parsed += bytes.len();
                 }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                Err(_) => break,
             }
         }
         if parsed >= DRAIN_BUDGET {
@@ -259,7 +264,8 @@ impl TermSurface {
         self.id
     }
 
-    pub fn is_pty(&self) -> bool {
+    /// The surface runs a child process (rather than showing a stream).
+    fn is_pty(&self) -> bool {
         self.writer.is_some()
     }
 
@@ -268,7 +274,7 @@ impl TermSurface {
         *self.exit.lock().expect("exit")
     }
 
-    pub fn kill(&mut self) {
+    fn kill(&mut self) {
         if let Some(k) = self.killer.as_mut() {
             let _ = k.kill();
         }
@@ -288,7 +294,7 @@ impl TermSurface {
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        let (cols, rows) = (cols.max(2), rows.max(2));
+        let (cols, rows) = (cols.max(MIN_SIZE), rows.max(MIN_SIZE));
         if (cols, rows) == self.size {
             return;
         }
@@ -383,18 +389,19 @@ impl TermSurface {
             }
             return;
         }
-        self.scroll_lines(lines);
+        self.scroll_by(lines);
     }
 
-    pub fn scroll_lines(&mut self, lines: i32) {
+    pub fn scroll_by(&mut self, lines: i32) {
         self.core().term.scroll_viewport(ScrollViewport::Delta(lines as isize));
     }
 
-    pub fn scroll_to_bottom(&mut self) {
+    /// Show the newest output (new output then keeps it in view).
+    pub fn scroll_bottom(&mut self) {
         self.core().term.scroll_viewport(ScrollViewport::Bottom);
     }
 
-    pub fn scroll_to_top(&mut self) {
+    pub fn scroll_top(&mut self) {
         self.core().term.scroll_viewport(ScrollViewport::Top);
     }
 
@@ -408,11 +415,17 @@ impl TermSurface {
         self.core().term.scrollbar().map(|s| (s.total as usize, s.offset as usize, s.len as usize)).unwrap_or((0, 0, 0))
     }
 
-    /// Text between screen-absolute (row, col) positions, inclusive.
+    /// Text between screen-absolute (row, col) positions, inclusive, in either order.
     pub fn text_between(&self, start: (usize, usize), end: (usize, usize)) -> String {
         let (start, end) = if start <= end { (start, end) } else { (end, start) };
         let at = |(row, col): (usize, usize)| Point::Screen(PointCoordinate { x: col as u16, y: row as u32 });
         read_text(&self.core().term, at(start), at(end))
+    }
+
+    /// Text of a screen-absolute row.
+    pub fn row_text(&self, row: usize) -> String {
+        let core = self.core();
+        row_text(&core.term, row)
     }
 
     /// Every match of `query` in the scrollback and screen, top to bottom.
@@ -422,15 +435,14 @@ impl TermSurface {
         let cols = c.term.cols().unwrap_or(1).max(1);
         let rows: Vec<(String, bool)> = (0..total)
             .map(|y| {
-                let at = |x: u16| Point::Screen(PointCoordinate { x, y: y as u32 });
                 let wrapped = c
                     .term
-                    .grid_ref(at(0))
+                    .grid_ref(Point::Screen(PointCoordinate { x: 0, y: y as u32 }))
                     .ok()
                     .and_then(|g| g.row().ok())
                     .and_then(|r| r.is_wrapped().ok())
                     .unwrap_or(false);
-                (read_text(&c.term, at(0), at(cols - 1)), wrapped)
+                (row_text(&c.term, y), wrapped)
             })
             .collect();
         find::find_in_rows(&rows, cols as usize, query)
@@ -451,13 +463,12 @@ impl TermSurface {
         top + len >= total
     }
 
-    /// Plain text of the visible viewport rows (tests and word selection).
+    /// Plain text of the visible viewport rows.
+    #[cfg(test)]
     pub fn viewport_text(&self) -> Vec<String> {
-        let c = self.core();
-        let rows = c.term.rows().unwrap_or(0);
-        let last = c.term.cols().unwrap_or(1).saturating_sub(1);
-        let at = |x: u16, y: u16| Point::Viewport(PointCoordinate { x, y: y as u32 });
-        (0..rows).map(|r| read_text(&c.term, at(0, r), at(last, r))).collect()
+        let top = self.viewport_top();
+        let rows = self.core().term.rows().unwrap_or(0) as usize;
+        (top..top + rows).map(|r| self.row_text(r)).collect()
     }
 
     /// Write a status line into the terminal (e.g. "[process exited]").
@@ -469,6 +480,13 @@ impl TermSurface {
     pub fn ack(&self) {
         self.pending.store(false, Ordering::Release);
     }
+}
+
+/// Plain text of one screen-absolute row (empty past the end).
+fn row_text(term: &Terminal<'_, '_>, row: usize) -> String {
+    let last = term.cols().unwrap_or(1).saturating_sub(1);
+    let at = |x: u16| Point::Screen(PointCoordinate { x, y: row as u32 });
+    read_text(term, at(0), at(last))
 }
 
 /// Plain text of the inclusive range between two points, as copied to the
@@ -655,7 +673,7 @@ mod tests {
         let (total, offset, len) = t.scrollbar();
         assert_eq!(len, 3);
         assert!(total >= 10 && offset + len == total, "{total} {offset} {len}");
-        t.scroll_lines(-2);
+        t.scroll_by(-2);
         assert_eq!(t.viewport_top(), offset - 2);
         let top = t.viewport_top();
         assert_eq!(t.text_between((top, 0), (top + 1, 9)), "line6\nline7");

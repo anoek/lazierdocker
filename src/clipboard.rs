@@ -46,7 +46,11 @@ fn native_copy(text: &str) -> bool {
                 Ok(None) if start.elapsed() < Duration::from_millis(500) => {
                     std::thread::sleep(Duration::from_millis(10))
                 }
-                Ok(None) => return true,
+                Ok(None) => {
+                    // Still serving the selection: reap it whenever it exits.
+                    std::thread::spawn(move || child.wait());
+                    return true;
+                }
                 Err(_) => break,
             }
         }
@@ -55,7 +59,7 @@ fn native_copy(text: &str) -> bool {
 }
 
 /// The OSC 52 sequence that sets the clipboard to `text`.
-pub fn osc52(text: &str) -> String {
+fn osc52(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text.as_bytes()))
 }
 

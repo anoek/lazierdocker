@@ -9,13 +9,6 @@ pub struct Match {
     pub end: (usize, usize),
 }
 
-impl Match {
-    /// The match covers this cell.
-    pub fn contains(&self, row: usize, col: usize) -> bool {
-        (row, col) >= self.start && (row, col) <= self.end
-    }
-}
-
 /// Find every non-overlapping occurrence of `query` in `rows`, top to bottom.
 ///
 /// `rows` holds each row's text (trailing blanks trimmed) and whether it
@@ -127,12 +120,5 @@ mod tests {
         let r = rows(&[("aaaa", false)]);
         assert!(find_in_rows(&r, 10, "").is_empty());
         assert_eq!(find_in_rows(&r, 10, "aa").len(), 2);
-    }
-
-    #[test]
-    fn contains_spans_rows() {
-        let m = Match { start: (0, 6), end: (1, 2) };
-        assert!(m.contains(0, 7) && m.contains(1, 0) && m.contains(1, 2));
-        assert!(!m.contains(0, 5) && !m.contains(1, 3));
     }
 }

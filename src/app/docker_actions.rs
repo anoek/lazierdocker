@@ -1,8 +1,9 @@
-//! lazydocker's per-item actions, menus and confirmations (inventory §3–4).
+//! lazydocker's per-item actions, menus and confirmations
+//! (docs/reference/lazydocker-inventory.md §3–4).
 
 use super::actions::Action;
-use super::overlay::{Menu, MenuItem, Overlay};
-use super::{App, Effect};
+use super::overlay::{Menu, MenuItem};
+use super::App;
 use crate::docker::model::ContainerState;
 use crate::docker::ops::DockerOp;
 use crate::docker::present;
@@ -11,7 +12,7 @@ use crate::ui::sidebar::{NodeKey, Section};
 impl App {
     /// `docker compose [-f …] [--project-directory …] -p <project>` for a project,
     /// or an error when we can't locate its compose files.
-    pub fn compose_base(&self, project: &str) -> Result<Vec<String>, String> {
+    fn compose_base(&self, project: &str) -> Result<Vec<String>, String> {
         let mut argv = vec!["docker".to_string(), "compose".to_string()];
         let local = self.snap.project(project).is_some_and(|p| p.local);
         if local {
@@ -44,7 +45,7 @@ impl App {
         Ok(argv)
     }
 
-    fn compose(&self, project: &str, args: &[&str]) -> Result<Vec<String>, String> {
+    pub(super) fn compose(&self, project: &str, args: &[&str]) -> Result<Vec<String>, String> {
         let mut argv = self.compose_base(project)?;
         argv.extend(args.iter().map(|s| s.to_string()));
         Ok(argv)
@@ -66,27 +67,18 @@ impl App {
         }
     }
 
-    fn ask(title: &str, body: String, danger: bool, action: Action) -> Action {
-        Action::Ask { title: title.into(), body, danger, action: Box::new(action) }
-    }
-
-    fn container_name(&self, id: &str) -> String {
+    /// A container's name, or its short id once it is gone.
+    pub(super) fn container_name(&self, id: &str) -> String {
         self.snap.container(id).map(|c| c.name.clone()).unwrap_or_else(|| id.chars().take(12).collect())
     }
 
-    /// Key handling for docker actions on an item. Returns None if the key
-    /// doesn't apply.
-    pub fn docker_key(&mut self, c: char, key: &NodeKey) -> Option<Vec<Effect>> {
-        let action = self.docker_key_action(c, key)?;
-        Some(self.perform(action))
-    }
-
-    fn docker_key_action(&self, c: char, key: &NodeKey) -> Option<Action> {
+    /// The docker action for a key on an item; None if the key doesn't apply.
+    pub(super) fn docker_key_action(&self, c: char, key: &NodeKey) -> Option<Action> {
         match key {
             NodeKey::Container(id) => self.container_action(c, id),
             NodeKey::Service(p, s) => self.service_action(c, p, s),
             NodeKey::Project(p) => match c {
-                'U' => Some(Self::ask(
+                'U' => Some(Action::ask(
                     "Up project",
                     format!("Run `docker compose up -d` for project {p}?"),
                     false,
@@ -124,8 +116,7 @@ impl App {
             },
             NodeKey::Network(id) => match c {
                 'd' => {
-                    let name =
-                        self.snap.networks.iter().find(|n| &n.id == id).map(|n| n.name.clone()).unwrap_or_default();
+                    let name = self.snap.network(id).map(|n| n.name.clone()).unwrap_or_default();
                     Some(Action::Menu(Menu::new(
                         format!("Remove network {name}"),
                         vec![MenuItem::new("remove", Action::Docker(DockerOp::RemoveNetwork { id: id.clone() }))
@@ -148,7 +139,7 @@ impl App {
         let name = cont.name.clone();
         let id = id.to_string();
         Some(match c {
-            's' => Self::ask(
+            's' => Action::ask(
                 "Stop container",
                 format!("Are you sure you want to stop {name}?"),
                 false,
@@ -173,20 +164,19 @@ impl App {
         })
     }
 
-    fn service_action(&self, c: char, project: &str, service: &str) -> Option<Action> {
-        let container = self.snap.service(project, service)?.container_id.clone();
-        let p = project;
-        let s = service;
+    /// Service keys: compose commands, or plain docker calls on its container
+    /// when the project's compose files aren't available here.
+    fn service_action(&self, c: char, p: &str, s: &str) -> Option<Action> {
+        let container = self.snap.service(p, s)?.container_id.clone();
         let has_files = self.compose_base(p).is_ok();
         Some(match c {
             'u' => self.compose_action(p, &["up", "-d", s]),
             's' => {
                 let action = match (&container, has_files) {
-                    (_, true) => self.compose_action(p, &["stop", s]),
                     (Some(id), false) => Action::Docker(DockerOp::Stop(id.clone())),
-                    (None, false) => self.compose_action(p, &["stop", s]),
+                    _ => self.compose_action(p, &["stop", s]),
                 };
-                Self::ask("Stop service", format!("Are you sure you want to stop service {s}?"), false, action)
+                Action::ask("Stop service", format!("Are you sure you want to stop service {s}?"), false, action)
             }
             'r' => match (&container, has_files) {
                 (Some(id), false) => Action::Docker(DockerOp::Restart(id.clone())),
@@ -226,7 +216,7 @@ impl App {
                         .detail(format!("compose up -d --build {s}")),
                 ],
             )),
-            'U' => Self::ask(
+            'U' => Action::ask(
                 "Up project",
                 format!("Run `docker compose up -d` for project {p}?"),
                 false,
@@ -268,7 +258,7 @@ impl App {
     }
 
     fn image_remove_menu(&self, id: &str) -> Menu {
-        let name = self.snap.images.iter().find(|i| i.id == id).map(|i| i.display()).unwrap_or_default();
+        let name = self.snap.image(id).map(|i| i.display()).unwrap_or_default();
         let op = |force, no_prune| Action::Docker(DockerOp::RemoveImage { id: id.into(), force, no_prune });
         Menu::new(
             format!("Remove image {name}"),
@@ -297,7 +287,7 @@ impl App {
         )
     }
 
-    pub fn bulk_services_menu(&self, p: &str) -> Menu {
+    pub(super) fn bulk_services_menu(&self, p: &str) -> Menu {
         Menu::new(
             format!("Bulk commands: {p}"),
             vec![
@@ -324,11 +314,11 @@ impl App {
         )
     }
 
-    pub fn bulk_menu(&self, section: Section) -> Menu {
+    fn bulk_menu(&self, section: Section) -> Menu {
         let prune = |what: &str, op: DockerOp| {
             MenuItem::new(
                 format!("prune unused {what}"),
-                Self::ask(
+                Action::ask(
                     &format!("Prune {what}"),
                     format!("Are you sure you want to prune all unused {what}?"),
                     true,
@@ -348,7 +338,7 @@ impl App {
                     vec![
                         MenuItem::new(
                             "stop all containers",
-                            Self::ask(
+                            Action::ask(
                                 "Stop all",
                                 format!("Stop all {} running containers?", running.len()),
                                 true,
@@ -358,7 +348,7 @@ impl App {
                         .danger(),
                         MenuItem::new(
                             "remove all containers (forced)",
-                            Self::ask(
+                            Action::ask(
                                 "Remove all",
                                 format!("Force-remove all {} containers?", all.len()),
                                 true,
@@ -387,7 +377,7 @@ impl App {
 
     /// Docker items for an item's context menu: every key action that applies,
     /// with its key shown.
-    pub fn docker_menu_items(&self, key: &NodeKey) -> Vec<MenuItem> {
+    pub(super) fn docker_menu_items(&self, key: &NodeKey) -> Vec<MenuItem> {
         let candidates: &[(char, &str)] = match key {
             NodeKey::Container(_) => &[
                 ('s', "Stop"),
@@ -411,6 +401,8 @@ impl App {
             ],
             NodeKey::Project(_) => &[('U', "Up"), ('D', "Down…"), ('b', "Bulk…")],
             NodeKey::Image(_) | NodeKey::Volume(_) | NodeKey::Network(_) => &[('d', "Remove…"), ('b', "Prune…")],
+            // The Projects section's bulk menu is only a list of per-project
+            // menus, which the projects' own context menus already offer.
             NodeKey::Section(s) if *s != Section::Projects => &[('b', "Bulk…")],
             NodeKey::Section(_) => &[],
         };
@@ -418,8 +410,9 @@ impl App {
             .iter()
             .filter_map(|(c, label)| {
                 let action = self.docker_key_action(*c, key)?;
-                // Leave out items that can only say why they can't run (no published port to open).
-                if matches!(action, Action::Flash(_)) {
+                // Leave out items that can only say why they can't run (no
+                // published port to open, no compose files on this machine).
+                if matches!(action, Action::Flash(_) | Action::Error(_)) {
                     return None;
                 }
                 let danger = matches!(c, 'd' | 'D');
@@ -427,10 +420,5 @@ impl App {
                 Some(if danger { item.danger() } else { item })
             })
             .collect()
-    }
-
-    pub fn open_menu(&mut self, m: Menu) {
-        self.overlay = Some(Overlay::Menu(m));
-        self.dirty = true;
     }
 }

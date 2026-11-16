@@ -5,7 +5,7 @@
 //! Writes the screen as HTML; `make screenshot` turns it into
 //! `docs/screenshot.png` with headless Chromium and ImageMagick.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,8 +19,8 @@ use lazierdocker::app::actions::Action;
 use lazierdocker::app::inspect::Tab;
 use lazierdocker::app::{App, Content};
 use lazierdocker::docker::model::{
-    derive_projects, Container, ContainerState, Health, Image, LocalCompose, Network, Port, Snapshot, Volume,
-    LABEL_PROJECT, LABEL_SERVICE,
+    derive_projects, parse_exit_code, parse_health, Container, ContainerState, Image, LocalCompose, Network, Port,
+    Snapshot, Volume, LABEL_PROJECT, LABEL_SERVICE,
 };
 use lazierdocker::docker::stats::{StatsHistory, StatsSample};
 use lazierdocker::event::AppEvent;
@@ -45,15 +45,13 @@ fn container(name: &str, image: &str, state: ContainerState, status: &str, svc: 
         name: name.into(),
         image: image.into(),
         state,
-        status: status.into(),
-        exit_code: (state == ContainerState::Exited).then_some(0),
-        health: None,
+        exit_code: parse_exit_code(status),
+        health: parse_health(status),
         ports: vec![],
         labels,
         project: svc.map(|s| s.0.into()),
         service: svc.map(|s| s.1.into()),
         oneoff: false,
-        created: 0,
     }
 }
 
@@ -79,7 +77,6 @@ fn snapshot() -> Snapshot {
     ];
     containers[0].ports =
         vec![Port { ip: Some("0.0.0.0".into()), private: 80, public: Some(8080), proto: "tcp".into() }];
-    containers[3].health = Some(Health::Healthy);
     let local = LocalCompose {
         project: "shop".into(),
         services: ["web", "api", "worker", "postgres", "redis"].map(String::from).to_vec(),
@@ -89,8 +86,6 @@ fn snapshot() -> Snapshot {
         name: name.into(),
         tag: tag.into(),
         size: mb * 1_000_000,
-        created: 0,
-        containers: 1,
     };
     Snapshot {
         projects: derive_projects(&containers, Some(&local)),
@@ -133,7 +128,7 @@ fn sample(cpu: f64, mem_mb: u64, pids: u64) -> StatsSample {
 /// Two and a half minutes of plausible postgres load.
 fn history() -> StatsHistory {
     let now = Instant::now();
-    let mut h = StatsHistory { samples: VecDeque::new() };
+    let mut h = StatsHistory::default();
     for i in 0..150u64 {
         let t = i as f64;
         let cpu =
@@ -239,6 +234,7 @@ fn main() {
     app.handle_key(key(KeyCode::Enter));
     app.handle_key(key(KeyCode::Char('n')));
     app.sync_panes();
+    // Draw twice: the first frame settles pane sizes (and content that depends on them).
     draw(&mut app, cols, rows);
     let buf = draw(&mut app, cols, rows);
     std::fs::write(&out, html(&buf)).expect("write html");

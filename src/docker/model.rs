@@ -11,7 +11,6 @@ use bollard::models::{
 pub const LABEL_PROJECT: &str = "com.docker.compose.project";
 pub const LABEL_SERVICE: &str = "com.docker.compose.service";
 pub const LABEL_ONEOFF: &str = "com.docker.compose.oneoff";
-pub const LABEL_NUMBER: &str = "com.docker.compose.container-number";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContainerState {
@@ -73,7 +72,6 @@ pub struct Container {
     pub name: String,
     pub image: String,
     pub state: ContainerState,
-    pub status: String,
     pub exit_code: Option<i64>,
     pub health: Option<Health>,
     pub ports: Vec<Port>,
@@ -81,14 +79,9 @@ pub struct Container {
     pub project: Option<String>,
     pub service: Option<String>,
     pub oneoff: bool,
-    pub created: i64,
 }
 
 impl Container {
-    pub fn short_id(&self) -> &str {
-        &self.id[..self.id.len().min(12)]
-    }
-
     pub fn is_running(&self) -> bool {
         matches!(self.state, ContainerState::Running | ContainerState::Restarting | ContainerState::Paused)
     }
@@ -115,8 +108,6 @@ pub struct Image {
     pub name: String,
     pub tag: String,
     pub size: i64,
-    pub created: i64,
-    pub containers: i64,
 }
 
 impl Image {
@@ -170,13 +161,21 @@ impl Snapshot {
         self.project(project)?.services.iter().find(|s| s.name == name)
     }
 
+    pub fn image(&self, id: &str) -> Option<&Image> {
+        self.images.iter().find(|i| i.id == id)
+    }
+
+    pub fn network(&self, id: &str) -> Option<&Network> {
+        self.networks.iter().find(|n| n.id == id)
+    }
+
     /// Containers not represented by a compose service row (one-offs and plain containers).
     pub fn standalone_containers(&self) -> impl Iterator<Item = &Container> {
         self.containers.iter().filter(|c| c.oneoff || c.service.is_none() || c.project.is_none())
     }
 }
 
-/// Local compose project context: (project name, service names from `docker compose config --services`).
+/// The compose project in the current directory: its name and services (from `docker compose config`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LocalCompose {
     pub project: String,
@@ -228,7 +227,7 @@ fn port_from(p: &PortSummary) -> Port {
 impl Container {
     pub fn from_summary(s: &ContainerSummary) -> Self {
         let labels: BTreeMap<String, String> = s.labels.clone().unwrap_or_default().into_iter().collect();
-        let status = s.status.clone().unwrap_or_default();
+        let status = s.status.as_deref().unwrap_or_default();
         let name = s
             .names
             .as_ref()
@@ -243,15 +242,13 @@ impl Container {
             name,
             image: s.image.clone().unwrap_or_default().trim_start_matches("sha256:").to_string(),
             state: state_from(s.state.as_ref()),
-            exit_code: parse_exit_code(&status),
-            health: parse_health(&status),
-            status,
+            exit_code: parse_exit_code(status),
+            health: parse_health(status),
             ports,
             project: labels.get(LABEL_PROJECT).cloned(),
             service: labels.get(LABEL_SERVICE).cloned(),
             oneoff: labels.get(LABEL_ONEOFF).is_some_and(|v| v.eq_ignore_ascii_case("true")),
             labels,
-            created: s.created.unwrap_or_default(),
         }
     }
 }
@@ -265,7 +262,7 @@ impl Image {
             },
             None => ("<none>".to_string(), String::new()),
         };
-        Image { id: s.id.clone(), name, tag, size: s.size, created: s.created, containers: s.containers }
+        Image { id: s.id.clone(), name, tag, size: s.size }
     }
 }
 
@@ -362,7 +359,6 @@ pub(crate) mod tests {
             name: name.into(),
             image: "alpine:3.20".into(),
             state,
-            status: String::new(),
             exit_code: None,
             health: None,
             ports: vec![],
@@ -370,7 +366,6 @@ pub(crate) mod tests {
             service: project.map(|p| p.1.into()),
             oneoff: false,
             labels,
-            created: 0,
         }
     }
 
